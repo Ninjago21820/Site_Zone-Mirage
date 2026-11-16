@@ -1,0 +1,343 @@
+@import 'tailwindcss';
+
+@theme {
+  --font-sans: 'Space Grotesk', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
+
+  --color-ink-950: #070709;
+  --color-ink-900: #0a0a0d;
+  --color-ink-850: #0e0e12;
+  --color-ink-800: #121217;
+  --color-ink-700: #191920;
+  --color-ink-600: #23232c;
+  --color-ink-500: #33333f;
+  --color-ink-400: #4b4b5a;
+
+  --color-bone-100: #f2f2f5;
+  --color-bone-200: #e2e2e8;
+  --color-bone-300: #c9c9d2;
+  --color-bone-400: #9d9daa;
+  --color-bone-500: #74747f;
+
+  --color-alert-300: #ff6b76;
+  --color-alert-400: #ff3b4a;
+  --color-alert-500: #e11d2e;
+  --color-alert-600: #b81223;
+  --color-alert-700: #7d0d18;
+
+  --color-signal-400: #d9a441;
+  --color-signal-500: #b8862a;
+}
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  html {
+    scrollbar-color: var(--color-ink-600) var(--color-ink-950);
+    scrollbar-width: thin;
+  }
+
+  body {
+    margin: 0;
+    background-color: var(--color-ink-950);
+    color: var(--color-bone-200);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    min-height: 100vh;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--color-alert-500) 55%, transparent);
+    color: #fff;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-alert-400);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+
+  h1, h2, h3, h4 {
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    color: var(--color-bone-100);
+    text-wrap: balance;
+  }
+
+  a {
+    color: inherit;
+  }
+
+  input, select, textarea, button {
+    font: inherit;
+  }
+
+  /* Screen-reader + password-manager friendly: inputs stay real inputs. */
+  input:-webkit-autofill,
+  input:-webkit-autofill:focus {
+    -webkit-text-fill-color: var(--color-bone-100);
+    -webkit-box-shadow: 0 0 0 1000px var(--color-ink-800) inset;
+    caret-color: var(--color-bone-100);
+  }
+}
+
+@layer components {
+  .zm-panel {
+    background: linear-gradient(180deg, rgba(20, 20, 26, 0.92), rgba(10, 10, 13, 0.94));
+    border: 1px solid var(--color-ink-600);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  }
+
+  .zm-grid-bg {
+    background-image:
+      linear-gradient(to right, rgba(255, 255, 255, 0.028) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255, 255, 255, 0.028) 1px, transparent 1px);
+    background-size: 44px 44px;
+  }
+
+  .zm-label {
+    font-family: var(--font-mono);
+    font-size: 0.6875rem;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+    color: var(--color-bone-400);
+  }
+
+  .zm-hairline {
+    background-image: linear-gradient(to right, transparent, var(--color-ink-500), transparent);
+    height: 1px;
+  }
+
+  .zm-input {
+    width: 100%;
+    background: rgba(8, 8, 10, 0.85);
+    border: 1px solid var(--color-ink-500);
+    color: var(--color-bone-100);
+    padding: 0.625rem 0.75rem;
+    font-size: 0.875rem;
+    border-radius: 2px;
+    transition: border-color 120ms ease, box-shadow 120ms ease;
+  }
+  .zm-input::placeholder {
+    color: var(--color-bone-500);
+  }
+  .zm-input:hover {
+    border-color: var(--color-ink-400);
+  }
+  .zm-input:focus {
+    outline: none;
+    border-color: var(--color-alert-500);
+    box-shadow: 0 0 0 1px color-mix(in oklab, var(--color-alert-500) 60%, transparent);
+  }
+  .zm-input[aria-invalid='true'] {
+    border-color: var(--color-alert-400);
+  }
+
+  .zm-link {
+    color: var(--color-bone-200);
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+    transition: color 120ms ease, border-color 120ms ease;
+  }
+  .zm-link:hover {
+    color: var(--color-alert-300);
+    border-bottom-color: color-mix(in oklab, var(--color-alert-400) 60%, transparent);
+  }
+
+  .zm-prose {
+    color: var(--color-bone-300);
+    line-height: 1.75;
+    font-size: 0.9375rem;
+  }
+  .zm-prose h2 {
+    font-size: 1.125rem;
+    margin: 2rem 0 0.75rem;
+    padding-bottom: 0.4rem;
+    border-bottom: 1px solid var(--color-ink-600);
+    font-family: var(--font-mono);
+    letter-spacing: 0.02em;
+  }
+  .zm-prose h3 {
+    font-size: 1rem;
+    margin: 1.5rem 0 0.5rem;
+    color: var(--color-bone-100);
+  }
+  .zm-prose p {
+    margin: 0.75rem 0;
+  }
+  .zm-prose ul {
+    margin: 0.75rem 0;
+    padding-left: 1.1rem;
+    list-style: none;
+  }
+  .zm-prose li {
+    position: relative;
+    padding-left: 0.9rem;
+    margin: 0.3rem 0;
+  }
+  .zm-prose li::before {
+    content: '▪';
+    position: absolute;
+    left: 0;
+    color: var(--color-alert-500);
+  }
+  .zm-prose ol {
+    margin: 0.75rem 0;
+    padding-left: 1.4rem;
+    list-style: decimal;
+  }
+  .zm-prose ol li {
+    padding-left: 0.2rem;
+  }
+  .zm-prose ol li::before {
+    content: none;
+  }
+  .zm-prose blockquote {
+    margin: 1rem 0;
+    padding: 0.75rem 1rem;
+    border-left: 2px solid var(--color-alert-500);
+    background: rgba(225, 29, 46, 0.06);
+    color: var(--color-bone-200);
+    font-style: normal;
+  }
+  .zm-prose code {
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    background: var(--color-ink-800);
+    border: 1px solid var(--color-ink-600);
+    padding: 0.05rem 0.3rem;
+  }
+  .zm-prose pre {
+    background: var(--color-ink-900);
+    border: 1px solid var(--color-ink-600);
+    padding: 0.85rem;
+    overflow-x: auto;
+    font-size: 0.8125rem;
+    margin: 1rem 0;
+  }
+  .zm-prose pre code {
+    border: 0;
+    background: none;
+    padding: 0;
+  }
+  .zm-prose a {
+    color: var(--color-alert-300);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .zm-prose table {
+    width: 100%;
+    border-collapse: collapse;
+    margin: 1rem 0;
+    font-size: 0.8125rem;
+    font-family: var(--font-mono);
+  }
+  .zm-prose th, .zm-prose td {
+    border: 1px solid var(--color-ink-600);
+    padding: 0.4rem 0.6rem;
+    text-align: left;
+  }
+  .zm-prose th {
+    background: var(--color-ink-800);
+    color: var(--color-bone-100);
+    font-weight: 500;
+    letter-spacing: 0.04em;
+  }
+}
+
+@layer utilities {
+  .zm-scanlines::after {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: 70;
+    pointer-events: none;
+    background-image: repeating-linear-gradient(
+      to bottom,
+      rgba(255, 255, 255, 0.055) 0px,
+      rgba(255, 255, 255, 0.055) 1px,
+      rgba(0, 0, 0, 0) 1px,
+      rgba(0, 0, 0, 0) 3px
+    );
+    opacity: 0.62;
+    mix-blend-mode: screen;
+  }
+
+  .zm-scanlines::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    z-index: 69;
+    pointer-events: none;
+    background: radial-gradient(ellipse at 50% 0%, rgba(225, 29, 46, 0.07), transparent 55%),
+      radial-gradient(ellipse at 50% 100%, rgba(0, 0, 0, 0.55), transparent 60%);
+  }
+
+  .zm-flicker {
+    animation: zm-flicker 7s steps(60, end) infinite;
+  }
+
+  @keyframes zm-flicker {
+    0%, 96%, 100% { opacity: 0.62; }
+    97% { opacity: 0.48; }
+    98% { opacity: 0.68; }
+    99% { opacity: 0.55; }
+  }
+
+  .zm-ticker {
+    animation: zm-ticker 46s linear infinite;
+  }
+
+  @keyframes zm-ticker {
+    from { transform: translateX(0); }
+    to { transform: translateX(-50%); }
+  }
+
+  .zm-pulse-dot {
+    animation: zm-pulse 2.4s ease-in-out infinite;
+  }
+
+  @keyframes zm-pulse {
+    0%, 100% { opacity: 1; box-shadow: 0 0 0 0 rgba(225, 29, 46, 0.5); }
+    50% { opacity: 0.65; box-shadow: 0 0 0 4px rgba(225, 29, 46, 0); }
+  }
+
+  .zm-rise {
+    animation: zm-rise 420ms cubic-bezier(0.16, 1, 0.3, 1) both;
+  }
+
+  @keyframes zm-rise {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: none; }
+  }
+}
+
+/* Terminal effects must be switchable off, and motion must respect the OS setting. */
+html.zm-no-scanlines .zm-scanlines::after,
+html.zm-no-scanlines .zm-scanlines::before {
+  display: none;
+}
+html.zm-no-scanlines .zm-flicker {
+  animation: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .zm-scanlines::after {
+    opacity: 0.45;
+  }
+  .zm-ticker {
+    animation: none;
+    transform: none;
+  }
+}

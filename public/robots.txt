@@ -1,0 +1,7 @@
+# SCP: Mirage Protocol — site officiel (jeu en développement)
+User-agent: *
+Allow: /
+Disallow: /console-mirage
+Disallow: /api/
+
+Sitemap: https://scp-mirage-protocol.example/sitemap.xml

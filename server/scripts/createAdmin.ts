@@ -9,57 +9,82 @@
  * Le compte est créé avec l'obligation d'enrôler la double authentification :
  * à la première connexion, l'écran d'enrôlement TOTP/passkey est imposé.
  */
-import readline from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import { openDb } from '../db.js';
 import { mirageIdFor, newId } from '../lib/ids.js';
 import { evaluatePassword, hashPassword } from '../lib/password.js';
 import { appendAudit } from '../lib/audit.js';
 
-const rl = readline.createInterface({ input: stdin, output: stdout });
-
 function fail(message: string): never {
   console.error(`\n  Erreur : ${message}\n`);
-  rl.close();
   process.exit(1);
 }
 
-async function ask(question: string, options: { silent?: boolean } = {}): Promise<string> {
-  if (!options.silent) return (await rl.question(question)).trim();
-  // Saisie masquée pour les mots de passe.
-  return new Promise<string>((resolve) => {
-    const onData = (char: Buffer) => {
-      const text = char.toString();
-      if (text === '\n' || text === '\r' || text === '\u0004') {
-        stdin.setRawMode?.(false);
-        stdin.pause();
-        stdin.removeListener('data', onData);
-        stdout.write('\n');
-        resolve(value);
-      } else if (text === '\u0003') {
+/**
+ * Lecture ligne par ligne sur stdin : un seul écouteur, sans `readline`, pour
+ * que la saisie masquée du mot de passe ne perde jamais les lignes déjà reçues
+ * (pipe, terminal, saisie collée d'un coup). Aucun écho en mode secret.
+ */
+function createReader() {
+  const queued: string[] = [];
+  let current = '';
+  let secretMode = false;
+  let active: ((line: string) => void) | null = null;
+
+  stdin.on('data', (chunk: Buffer) => {
+    for (const char of chunk.toString('utf8')) {
+      if (char === '\u0003') {
         stdout.write('\n');
         process.exit(130);
-      } else if (text === '\u007f') {
-        if (value.length) {
-          value = value.slice(0, -1);
-          stdout.write('\b \b');
-        }
-      } else {
-        value += text;
-        stdout.write('*');
       }
-    };
-    let value = '';
-    stdout.write(question);
-    stdin.resume();
-    stdin.setRawMode?.(true);
-    stdin.on('data', onData);
+      if (char === '\r' || char === '\n') {
+        const line = current;
+        current = '';
+        if (active) {
+          const resolve = active;
+          active = null;
+          resolve(line);
+        } else {
+          queued.push(line);
+        }
+        continue;
+      }
+      if (char === '\u007f' || char === '\b') {
+        if (current.length > 0) {
+          current = current.slice(0, -1);
+          if (!secretMode) stdout.write('\b \b');
+        }
+        continue;
+      }
+      if (char === '\u0004') continue;
+      current += char;
+      if (!secretMode) stdout.write(char);
+    }
   });
+  if (stdin.isTTY) stdin.setRawMode?.(true);
+  stdin.resume();
+
+  return function ask(question: string, secret = false): Promise<string> {
+    stdout.write(question);
+    secretMode = secret;
+    const settle = (line: string): string => {
+      secretMode = false;
+      if (secret) stdout.write('\n');
+      return line.trim();
+    };
+    const buffered = queued.shift();
+    if (buffered !== undefined) return Promise.resolve(settle(buffered));
+    return new Promise<string>((resolve) => {
+      active = (line) => resolve(settle(line));
+    });
+  };
 }
 
+const ask = createReader();
+
 async function askConfirmed(question: string): Promise<string> {
-  const first = await ask(question, { silent: true });
-  const second = await ask('Confirmez le mot de passe : ', { silent: true });
+  const first = await ask(question, true);
+  const second = await ask('Confirmez le mot de passe : ', true);
   if (first !== second) fail('les deux mots de passe ne correspondent pas.');
   return first;
 }
@@ -111,7 +136,6 @@ async function main() {
   console.log('  Back-office : /console-mirage\n');
 
   await db.close();
-  rl.close();
 }
 
 main().catch((error: unknown) => {

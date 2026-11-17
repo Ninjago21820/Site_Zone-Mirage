@@ -137,9 +137,14 @@ function AccountMenu() {
 
   if (!me.authenticated) {
     return (
-      <LinkButton to="/login" size="sm" variant="primary" className="hidden sm:inline-flex">
-        <User className="h-3 w-3" aria-hidden /> {t('nav.login')}
-      </LinkButton>
+      <div className="hidden sm:flex items-center gap-2">
+        <LinkButton to="/register" size="sm" variant="outline">
+          {t('nav.register')}
+        </LinkButton>
+        <LinkButton to="/login" size="sm" variant="primary">
+          <User className="h-3 w-3" aria-hidden /> {t('nav.login')}
+        </LinkButton>
+      </div>
     );
   }
 
@@ -309,9 +314,14 @@ export function Layout({ children }: { children: React.ReactNode }) {
                 </NavLink>
               ))}
               {!me.authenticated && (
-                <Link to="/login" className="px-3 py-2.5 font-mono text-[11px] uppercase tracking-[0.1em] text-alert-300">
-                  {t('nav.login')}
-                </Link>
+                <>
+                  <Link to="/register" className="px-3 py-2.5 font-mono text-[11px] uppercase tracking-[0.1em] text-alert-300">
+                    {t('nav.register')}
+                  </Link>
+                  <Link to="/login" className="px-3 py-2.5 font-mono text-[11px] uppercase tracking-[0.1em] text-alert-300">
+                    {t('nav.login')}
+                  </Link>
+                </>
               )}
             </nav>
           </div>
@@ -355,6 +365,22 @@ export function Layout({ children }: { children: React.ReactNode }) {
               ))}
               <li><Link to="/maintenance" className="text-bone-400 hover:text-bone-100">{t('nav.maintenance')}</Link></li>
               <li><Link to="/support" className="text-bone-400 hover:text-bone-100">{t('nav.support')}</Link></li>
+            </ul>
+            <p className="zm-label mt-4 mb-3">{t('nav.account')}</p>
+            <ul className="space-y-1.5 text-[12.5px]">
+              {me.authenticated ? (
+                <>
+                  <li><Link to="/account" className="text-bone-400 hover:text-bone-100">{t('nav.account')}</Link></li>
+                  {me.staff && (
+                    <li><Link to="/console-mirage" className="text-bone-400 hover:text-bone-100">{t('nav.backoffice')}</Link></li>
+                  )}
+                </>
+              ) : (
+                <>
+                  <li><Link to="/register" className="text-alert-300 hover:text-alert-200">{t('nav.register')}</Link></li>
+                  <li><Link to="/login" className="text-bone-400 hover:text-bone-100">{t('nav.login')}</Link></li>
+                </>
+              )}
             </ul>
           </div>
           <div>

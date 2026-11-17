@@ -1,7 +1,8 @@
 import { Link } from 'react-router-dom';
-import { ArrowRight, BookOpen, Map as MapIcon, Server, Trophy, TriangleAlert } from 'lucide-react';
+import { ArrowRight, BookOpen, Map as MapIcon, Server, Trophy, TriangleAlert, UserPlus } from 'lucide-react';
 import { useI18n } from '../i18n';
 import { useApi } from '../lib/useApi';
+import { useAuth } from '../context/AuthContext';
 import { Badge, LinkButton, Notice, Panel, SectionTitle, Spinner } from '../components/ui';
 import { formatDate } from '../lib/format';
 
@@ -12,6 +13,7 @@ interface SiteResponse {
 
 export default function Home() {
   const { t } = useI18n();
+  const { me } = useAuth();
   const { data: site } = useApi<SiteResponse>('/api/site');
   const { data: stats } = useApi<any>('/api/stats/global');
   const { data: servers } = useApi<any>('/api/servers');
@@ -49,7 +51,15 @@ export default function Home() {
                 <LinkButton to="/roadmap" variant="ghost" size="lg">
                   {t('nav.roadmap')} <ArrowRight className="h-3.5 w-3.5" aria-hidden />
                 </LinkButton>
+                {!me.authenticated && (
+                  <LinkButton to="/register" variant="outline" size="lg">
+                    <UserPlus className="h-4 w-4" aria-hidden /> {t('home.createAccount')}
+                  </LinkButton>
+                )}
               </div>
+              {!me.authenticated && (
+                <p className="mt-3 text-[12px] text-bone-500 max-w-xl">{t('home.createAccountBody')}</p>
+              )}
               <p className="mt-6 font-mono text-[10.5px] uppercase tracking-[0.14em] text-bone-500">
                 {t('home.noRelease')}
               </p>

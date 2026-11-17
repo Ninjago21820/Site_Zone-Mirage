@@ -26,7 +26,7 @@ const ISSUE_LABELS: Record<string, string> = {
 };
 
 export default function Register() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const navigate = useNavigate();
   const [form, setForm] = useState({ username: '', email: '', password: '', confirm: '' });
   const [accept, setAccept] = useState(false);
@@ -50,7 +50,7 @@ export default function Register() {
     setError(null);
     setIssues([]);
     try {
-      await apiPost('/api/auth/register', { username: form.username, email: form.email, password: form.password, locale: 'fr' });
+      await apiPost('/api/auth/register', { username: form.username, email: form.email, password: form.password, locale });
       navigate('/login?registered=1');
     } catch (err) {
       const apiError = err as ApiError;

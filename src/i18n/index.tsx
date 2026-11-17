@@ -276,6 +276,22 @@ const DICT: Record<string, Entry> = {
   'auth.forgot': ['Mot de passe oublié ?', 'Forgot password?'],
   'auth.noAccount': ['Pas encore de compte ?', 'No account yet?'],
   'auth.hasAccount': ['Déjà un compte ?', 'Already have an account?'],
+  'auth.register': ['Créer un compte', 'Create account'],
+  'auth.accountCreatedTitle': ['Compte créé', 'Account created'],
+  'auth.accountCreatedBody': [
+    'Votre compte est actif : connectez-vous avec votre pseudonyme ou votre adresse électronique.',
+    'Your account is active: sign in with your username or email address.',
+  ],
+  'auth.resetDoneTitle': ['Mot de passe modifié', 'Password changed'],
+  'auth.resetDoneBody': [
+    'Connectez-vous avec votre nouveau mot de passe.',
+    'Sign in with your new password.',
+  ],
+  'home.createAccount': ['Créer un compte', 'Create account'],
+  'home.createAccountBody': [
+    'Un compte suffit pour le profil joueur, les serveurs communautaires, les tickets et les classements.',
+    'One account covers your player profile, community servers, support tickets and leaderboards.',
+  ],
   'auth.twoFactor': ['Double authentification', 'Two-factor authentication'],
   'auth.twoFactorIntro': [
     'Saisissez le code à 6 chiffres de votre application d’authentification.',

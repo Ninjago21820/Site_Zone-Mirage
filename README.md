@@ -42,7 +42,7 @@ back-office, avec leur rôle et leurs droits issus des matrices §11.3/§11.4.
 | `npm start` | Exécution de la version compilée en `NODE_ENV=production` |
 | `npm run db:migrate` | Crée / met à jour le schéma sur la base configurée |
 | `npm run admin:create` | Crée un administrateur (première entrée du personnel) |
-| `npm test` | 121 tests : critères §6.14, matrices §11.3/§11.4, rendu des pages |
+| `npm test` | 122 tests : critères §6.14, matrices §11.3/§11.4, rendu des pages |
 | `npm run backup:verify` | Crée une sauvegarde chiffrée et vérifie sa restauration |
 
 ### Base de données
@@ -98,7 +98,7 @@ src/
   components/       primitives UI, layout, rendu Markdown assaini
   i18n/             fr, en (es/de/it masquées sous le seuil de traduction)
   styles.css        thème noir/rouge, scanlines terminal désactivables
-tests/              121 tests (sécurité, matrices, rendu React) + fixtures
+tests/              122 tests (sécurité, matrices, rendu React) + fixtures
 ```
 
 ## Sécurité — points saillants

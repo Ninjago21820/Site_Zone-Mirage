@@ -128,13 +128,23 @@ export default function Login() {
                     Après plusieurs échecs, une vérification est demandée. Elle est validée automatiquement par ce formulaire.
                   </Notice>
                 )}
+                {params.get('registered') === '1' && !error && (
+                  <Notice tone="ok" title={t('auth.accountCreatedTitle')}>
+                    {t('auth.accountCreatedBody')}
+                  </Notice>
+                )}
+                {params.get('reset') === '1' && !error && (
+                  <Notice tone="ok" title={t('auth.resetDoneTitle')}>
+                    {t('auth.resetDoneBody')}
+                  </Notice>
+                )}
                 {error && <Notice tone="danger">{error}</Notice>}
                 <Button type="submit" variant="primary" className="w-full" disabled={busy}>
                   {busy ? t('label.loading') : t('auth.submitLogin')}
                 </Button>
                 <div className="flex items-center justify-between text-[11.5px]">
                   <Link to="/forgot-password" className="text-bone-400 hover:text-bone-100">{t('auth.forgot')}</Link>
-                  <Link to="/register" className="text-alert-300 hover:text-alert-200">{t('auth.register')}</Link>
+                  <Link to="/register" className="text-alert-300 hover:text-alert-200">{t('nav.register')}</Link>
                 </div>
               </form>
             )}

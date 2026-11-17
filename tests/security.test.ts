@@ -73,6 +73,42 @@ describe('§6.3 / critère #1 — Politique de mots de passe', () => {
   });
 });
 
+describe('§5.1 — Création de compte', () => {
+  it('crée un compte joueur immédiatement utilisable et refuse les doublons', async () => {
+    const client = await newClient(h.app);
+    const username = `agent${rid()}`;
+    const email = `${username}@example.org`;
+    const created = await client.post('/api/auth/register', { username, email, password: 'Vault-Protocol-77!x' });
+    expect(created.status).toBe(201);
+    expect(created.body.username).toBe(username);
+    expect(created.body.mirageId).toMatch(/^MIRAGE:/);
+
+    const row = await h.db.get('SELECT role, status, email_verified FROM users WHERE username = ?', [username]) as
+      { role: string; status: string; email_verified: number };
+    expect(row.role).toBe('player');
+    expect(row.status).toBe('active');
+
+    const note = await h.db.get(
+      'SELECT 1 AS hit FROM notifications WHERE user_id = (SELECT id FROM users WHERE username = ?)',
+      [username],
+    );
+    expect(note).toBeTruthy();
+
+    // Le compte créé peut se connecter dans la foulée, sans étape supplémentaire.
+    const fresh = await newClient(h.app);
+    const login = await fresh.post('/api/auth/login', { identifier: email, password: 'Vault-Protocol-77!x' });
+    expect(login.status).toBe(200);
+
+    // Doublon : refus générique, sans indiquer lequel des deux champs existe déjà.
+    const duplicate = await newClient(h.app);
+    const again = await duplicate.post('/api/auth/register', {
+      username, email: `autre.${rid()}@example.org`, password: 'Vault-Protocol-78!x',
+    });
+    expect(again.status).toBe(409);
+    expect(again.body.error).toBe('registration_rejected');
+  });
+});
+
 describe('§6.5 / critère #5 — Anti-énumération', () => {
   it('renvoie une réponse identique pour un compte inconnu et un mot de passe erroné', async () => {
     const a = await newClient(h.app);

@@ -14,14 +14,16 @@ export interface RunResult {
 
 export type Row = Record<string, unknown>;
 
+export type Params = Param[] | [Record<string, Param>];
+
 export interface DB {
   readonly dialect: 'mysql' | 'sqlite';
   /** Single row or undefined. */
-  get<T = Row>(sql: string, params?: Param[]): Promise<T | undefined>;
+  get<T = Row>(sql: string, params?: Params): Promise<T | undefined>;
   /** Every matching row. */
-  all<T = Row>(sql: string, params?: Param[]): Promise<T[]>;
+  all<T = Row>(sql: string, params?: Params): Promise<T[]>;
   /** Executes a statement, returns the insert id (when relevant) and row count. */
-  run(sql: string, params?: Param[]): Promise<RunResult>;
+  run(sql: string, params?: Params): Promise<RunResult>;
   /** Multi-statement script (migrations only). */
   exec(sql: string): Promise<void>;
   /** Runs `fn` inside a transaction; nested calls reuse the outer context. */
@@ -52,6 +54,29 @@ export class DbError extends Error {
 
 export function normaliseParams(params: Param[] = []): Param[] {
   return params.map((value) => (value === undefined ? null : value));
+}
+
+/**
+ * Accepts the two notations used across the code base:
+ *  - positional:  run(sql, [a, b])
+ *  - nommée:      run('… @id …', [{ id, … }])
+ * Les paramètres nommés sont réécrits en `?` dans l'ordre d'apparition.
+ */
+export function bind(sql: string, params: Params = []): { sql: string; values: Param[] } {
+  if (params.length === 1) {
+    const candidate = params[0];
+    if (candidate && typeof candidate === 'object' && !Array.isArray(candidate) &&
+        !(candidate instanceof Date) && !(candidate instanceof Uint8Array) && /@\w+/.test(sql)) {
+      const record = candidate as Record<string, Param>;
+      const values: Param[] = [];
+      const text = sql.replace(/@(\w+)/g, (_match, key: string) => {
+        values.push(record[key] === undefined ? null : record[key]);
+        return '?';
+      });
+      return { sql: text, values: normaliseParams(values) };
+    }
+  }
+  return { sql, values: normaliseParams(params as Param[]) };
 }
 
 export function buildInsert(table: string, row: Record<string, Param>): { sql: string; params: Param[] } {

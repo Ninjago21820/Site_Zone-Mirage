@@ -8,7 +8,6 @@ import { formatDate } from '../lib/format';
 interface SiteResponse {
   site: { name: string; version: string; releaseLabel: string; tagline: string };
   latestNews: { slug: string; title: string; summary: string; publishedAt: number; category: string }[];
-  demoMode: boolean;
 }
 
 export default function Home() {

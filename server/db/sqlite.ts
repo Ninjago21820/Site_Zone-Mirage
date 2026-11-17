@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import Database from 'better-sqlite3';
-import { buildInsert, normaliseParams, type DB, type Param, type Row, type RunResult } from './types.js';
+import { bind, buildInsert, normaliseParams, type DB, type Param, type Params, type Row, type RunResult } from './types.js';
 import { upsertSql, insertIgnoreSql } from './dialect.js';
 
 /**
@@ -14,19 +14,22 @@ export function createSqliteDb(file: string): DB {
   if (file !== ':memory:') handle.pragma('journal_mode = WAL');
   handle.pragma('foreign_keys = ON');
 
-  const db: DB = {
+  const api: DB = {
     dialect: 'sqlite',
 
-    async get<T = Row>(sql: string, params: Param[] = []): Promise<T | undefined> {
-      return handle.prepare(sql).get(...normaliseParams(params)) as T | undefined;
+    async get<T = Row>(sql: string, params: Params = []): Promise<T | undefined> {
+      const bound = bind(sql, params);
+      return handle.prepare(bound.sql).get(...bound.values) as T | undefined;
     },
 
-    async all<T = Row>(sql: string, params: Param[] = []): Promise<T[]> {
-      return handle.prepare(sql).all(...normaliseParams(params)) as T[];
+    async all<T = Row>(sql: string, params: Params = []): Promise<T[]> {
+      const bound = bind(sql, params);
+      return handle.prepare(bound.sql).all(...bound.values) as T[];
     },
 
-    async run(sql: string, params: Param[] = []): Promise<RunResult> {
-      const info = handle.prepare(sql).run(...normaliseParams(params));
+    async run(sql: string, params: Params = []): Promise<RunResult> {
+      const bound = bind(sql, params);
+      const info = handle.prepare(bound.sql).run(...bound.values);
       return { lastInsertRowid: Number(info.lastInsertRowid), changes: Number(info.changes) };
     },
 
@@ -44,7 +47,7 @@ export function createSqliteDb(file: string): DB {
         try {
           handle.exec('ROLLBACK');
         } catch {
-          /* the transaction may already be closed */
+          /* transaction already closed */
         }
         throw error;
       }
@@ -53,13 +56,12 @@ export function createSqliteDb(file: string): DB {
     async upsert(table, row, conflictColumns) {
       const columns = Object.keys(row);
       const sql = upsertSql('sqlite', table, columns, conflictColumns);
-      handle.prepare(sql).run(...normaliseParams(columns.map((column) => row[column])));
+      handle.prepare(sql).run(...normaliseParams(columns.map((column) => row[column] as Param)));
     },
 
     async insertIgnore(table, row) {
-      const { sql, params } = buildInsert(table, row);
+      const { params } = buildInsert(table, row);
       handle.prepare(insertIgnoreSql('sqlite', table, Object.keys(row))).run(...normaliseParams(params));
-      void sql;
     },
 
     async tableNames(): Promise<string[]> {
@@ -70,9 +72,10 @@ export function createSqliteDb(file: string): DB {
     },
 
     async snapshot(): Promise<Record<string, Row[]>> {
-      const tables = await db.tableNames();
       const dump: Record<string, Row[]> = {};
-      for (const table of tables) dump[table] = handle.prepare(`SELECT * FROM ${table}`).all() as Row[];
+      for (const table of api.tableNames ? await api.tableNames() : []) {
+        dump[table] = handle.prepare(`SELECT * FROM ${table}`).all() as Row[];
+      }
       return dump;
     },
 
@@ -81,5 +84,5 @@ export function createSqliteDb(file: string): DB {
     },
   };
 
-  return db;
+  return api;
 }

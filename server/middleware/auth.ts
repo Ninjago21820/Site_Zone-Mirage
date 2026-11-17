@@ -10,22 +10,22 @@ import type { PublicUser } from '../types.js';
 import { sha256 } from '../lib/ids.js';
 
 export function sessionLoader(db: DB) {
-  return (req: Request, res: Response, next: NextFunction) => {
+  return async (req: Request, res: Response, next: NextFunction) => {
     const token = readCookie(req, SESSION_COOKIE);
     req.session = null;
     req.user = null;
     if (!token) return next();
-    const loaded = loadSession(db, token, clientIp(req), req.get('user-agent') ?? '');
+    const loaded = await loadSession(db, token, clientIp(req), req.get('user-agent') ?? '');
     if (!loaded) return next();
     if (loaded.expired) {
       res.clearCookie(SESSION_COOKIE, { path: COOKIE_PATH });
       return next();
     }
-    const user = db.prepare('SELECT * FROM users WHERE id = ?').get(loaded.session.user_id) as PublicUser | undefined;
+    const user = await db.get('SELECT * FROM users WHERE id = ?', [loaded.session.user_id]) as PublicUser | undefined;
     if (!user || user.status === 'banned' || user.status === 'suspended') {
       req.session = loaded.session;
       if (user && process.env.NODE_ENV !== 'test') {
-        appendAudit(db, {
+        await appendAudit(db, {
           actorId: user.id,
           actorRole: user.role,
           action: 'session.blocked',
@@ -40,7 +40,7 @@ export function sessionLoader(db: DB) {
     if (loaded.contextChanged) {
       req.ctxChanged = true;
       if (process.env.NODE_ENV !== 'test') {
-        appendAudit(db, {
+        await appendAudit(db, {
           actorId: user.id,
           actorRole: user.role,
           action: 'session.context_changed',
@@ -56,7 +56,7 @@ export function sessionLoader(db: DB) {
     req.user = user;
     req.session = loaded.session;
     req.sessionToken = token;
-    touchSession(db, loaded.session, user.role);
+    await touchSession(db, loaded.session, user.role);
     next();
   };
 }

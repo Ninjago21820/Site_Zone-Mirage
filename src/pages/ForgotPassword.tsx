@@ -39,15 +39,6 @@ export default function ForgotPassword() {
             <Notice tone="ok" title={t('auth.resetSent')}>
               <p>Aucune information sur l’existence du compte n’est révélée.</p>
             </Notice>
-            {sent.demoToken && (
-              <Notice tone="warn" title="Environnement de démonstration">
-                <p className="font-mono text-[10.5px] break-all">{sent.demoToken}</p>
-                <Link to={`/reset-password?token=${encodeURIComponent(sent.demoToken)}`}
-                  className="mt-2 inline-block font-mono text-[10.5px] uppercase tracking-[0.12em] text-alert-300 hover:text-alert-200">
-                  Ouvrir le lien de réinitialisation ↗
-                </Link>
-              </Notice>
-            )}
             <Link to="/login" className="block font-mono text-[10.5px] uppercase tracking-[0.12em] text-bone-400 hover:text-bone-100">
               Retour à la connexion
             </Link>

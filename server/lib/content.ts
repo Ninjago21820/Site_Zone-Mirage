@@ -60,17 +60,17 @@ export const WIKI_LICENSE = 'CC BY-SA 3.0';
 const FALLBACK_LOCALE = 'fr';
 export const SUPPORTED_LOCALES = ['fr', 'en', 'es', 'de', 'it'];
 
-export function getTranslations(db: DB, contentId: string): ContentTranslation[] {
-  return db.prepare('SELECT locale,title,summary,body FROM content_translations WHERE content_id = ?').all(contentId) as ContentTranslation[];
+export async function getTranslations(db: DB, contentId: string): Promise<ContentTranslation[]> {
+  return await db.all('SELECT locale,title,summary,body FROM content_translations WHERE content_id = ?', [contentId]) as ContentTranslation[];
 }
 
-export function serialize(
+export async function serialize(
   db: DB,
   row: ContentRow,
   locale = 'fr',
   translations?: ContentTranslation[],
-): SerializedContent {
-  const list = translations ?? getTranslations(db, row.id);
+): Promise<SerializedContent> {
+  const list = translations ?? await getTranslations(db, row.id);
   const requested = list.find((t) => t.locale === locale && (t.title || t.body));
   const fallback = list.find((t) => t.locale === FALLBACK_LOCALE) ?? list[0];
   const chosen = requested ?? fallback;
@@ -106,33 +106,32 @@ export function isPubliclyVisible(row: ContentRow, now = Date.now()): boolean {
   return false;
 }
 
-export function listPublished(db: DB, type: string, locale = 'fr', opts: { category?: string; limit?: number; search?: string; clearanceMax?: number } = {}) {
-  const rows = db.prepare(
-    "SELECT * FROM content WHERE type = ? AND status = 'published' AND (published_at IS NULL OR published_at <= ?) ORDER BY order_index ASC, published_at DESC",
-  ).all(type, Date.now()) as ContentRow[];
-  const filtered = rows.filter((r) => {
-    if (opts.category && r.category !== opts.category) return false;
+export async function listPublished(db: DB, type: string, locale = 'fr', opts: { category?: string; limit?: number; search?: string; clearanceMax?: number } = {}) {
+  const rows = await db.all("SELECT * FROM content WHERE type = ? AND status = 'published' AND (published_at IS NULL OR published_at <= ?) ORDER BY order_index ASC, published_at DESC", [type, Date.now()]) as ContentRow[];
+  const filtered: ContentRow[] = [];
+  for (const row of rows) {
+    if (opts.category && row.category !== opts.category) continue;
     if (opts.search) {
-      const q = opts.search.toLowerCase();
-      const tr = getTranslations(db, r.id);
-      const hit = tr.some((t) => `${t.title} ${t.summary} ${t.body}`.toLowerCase().includes(q));
-      if (!hit) return false;
+      const query = opts.search.toLowerCase();
+      const translations = await getTranslations(db, row.id);
+      const hit = translations.some((t) => `${t.title} ${t.summary} ${t.body}`.toLowerCase().includes(query));
+      if (!hit) continue;
     }
-    return true;
-  });
+    filtered.push(row);
+  }
   const limited = opts.limit ? filtered.slice(0, opts.limit) : filtered;
-  return limited.map((r) => serialize(db, r, locale));
+  const items = [];
+  for (const row of limited) items.push(await serialize(db, row, locale));
+  return items;
 }
 
-export function findBySlug(db: DB, type: string, slug: string): ContentRow | undefined {
-  return db.prepare('SELECT * FROM content WHERE type = ? AND slug = ?').get(type, slug) as ContentRow | undefined;
+export async function findBySlug(db: DB, type: string, slug: string): Promise<ContentRow | undefined> {
+  return await db.get('SELECT * FROM content WHERE type = ? AND slug = ?', [type, slug]) as ContentRow | undefined;
 }
 
-export function categoriesFor(db: DB, type: string): { category: string; count: number }[] {
-  return db.prepare(
-    `SELECT category, COUNT(*) AS count FROM content
-     WHERE type = ? AND status = 'published' AND category <> '' GROUP BY category ORDER BY category`,
-  ).all(type) as { category: string; count: number }[];
+export async function categoriesFor(db: DB, type: string): Promise<{ category: string; count: number }[]> {
+  return await db.all(`SELECT category, COUNT(*) AS count FROM content
+     WHERE type = ? AND status = 'published' AND category <> '' GROUP BY category ORDER BY category`, [type]) as { category: string; count: number }[];
 }
 
 export function clearanceRank(clearance: string | null | undefined): number {

@@ -299,7 +299,8 @@ CREATE TABLE IF NOT EXISTS notifications (
   body TEXT NOT NULL,
   read_at BIGINT,
   created_at BIGINT NOT NULL
-);;
+);
+`;
 
 export function schemaStatements(dialect: Dialect): string[] {
   const body = dialect === 'mysql' ? toMysql(STATEMENTS) : STATEMENTS;

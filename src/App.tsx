@@ -20,7 +20,6 @@ import Login from './pages/Login';
 import Register from './pages/Register';
 import ForgotPassword from './pages/ForgotPassword';
 import ResetPassword from './pages/ResetPassword';
-import OAuthMock from './pages/OAuthMock';
 import Account from './pages/Account';
 import Profile from './pages/Profile';
 import NotFound from './pages/NotFound';
@@ -70,7 +69,6 @@ export default function App() {
         <Route path="/register" element={<Layout><Register /></Layout>} />
         <Route path="/forgot-password" element={<Layout><ForgotPassword /></Layout>} />
         <Route path="/reset-password" element={<Layout><ResetPassword /></Layout>} />
-        <Route path="/oauth/mock" element={<Layout><OAuthMock /></Layout>} />
         <Route path="/account" element={<Layout><Account /></Layout>} />
         <Route path="/profile/:mirageId" element={<Layout><Profile /></Layout>} />
         <Route path="/admin/*" element={<Navigate to="/404" replace />} />

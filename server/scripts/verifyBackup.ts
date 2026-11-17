@@ -11,7 +11,7 @@
  */
 import path from 'node:path';
 import fs from 'node:fs';
-import { openDb, seed } from '../db.js';
+import { openDb } from '../db.js';
 import { createBackup, verifyBackup, latestBackup } from '../lib/backup.js';
 import { BACKUP_DIR } from '../config.js';
 
@@ -29,10 +29,9 @@ async function main() {
 
   let target = explicitFile;
   if (!target && (wantsCreate || !latestBackup())) {
-    const db = openDb();
-    await seed(db);
-    const result = createBackup(db, BACKUP_DIR, 'verify');
-    db.close();
+    const db = await openDb();
+    const result = await createBackup(db, BACKUP_DIR, 'verify');
+    await db.close();
     target = result.file;
     console.log(`Sauvegarde créée : ${path.basename(result.file)} (${(result.sizeBytes / 1024).toFixed(1)} Ko)`);
   }
@@ -44,7 +43,7 @@ async function main() {
   }
 
   console.log(`Cible   : ${path.basename(target)}\n`);
-  const verification = verifyBackup(target);
+  const verification = await verifyBackup(target);
   for (const check of verification.checks) {
     console.log(line(check.name, check.ok, check.detail));
   }
@@ -59,7 +58,7 @@ async function main() {
   process.exit(verification.ok ? 0 : 1);
 }
 
-main().catch((error) => {
+await main().catch((error) => {
   console.error('Erreur inattendue :', error);
   process.exit(1);
 });

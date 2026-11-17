@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import type { DB } from '../db.js';
 import {
-  ADMIN_PATH, DEMO_MODE, I18N_ACTIVE, I18N_MASKED, I18N_THRESHOLD, CROWDIN_URL,
+  ADMIN_PATH, I18N_ACTIVE, I18N_MASKED, I18N_THRESHOLD, CROWDIN_URL,
   TURNSTILE_SITE_KEY, IS_PROD,
 } from '../config.js';
 import {
@@ -9,7 +9,6 @@ import {
   WIKI_LICENSE, type ContentRow,
 } from '../lib/content.js';
 import { normaliseSearch } from '../lib/sanitize.js';
-import { DEMO_TOTP_SECRET } from '../db.js';
 import { rateLimit } from '../lib/throttle.js';
 import { sha256 } from '../lib/ids.js';
 import { clientIp } from '../middleware/security.js';
@@ -25,14 +24,14 @@ export function publicRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Bootstrap: everything the shell needs in one round-trip
    * ---------------------------------------------------------------- */
-  router.get('/site', (req, res) => {
+  router.get('/site', async (req, res) => {
     const locale = LOCALES.includes(String(req.query.locale)) ? String(req.query.locale) : 'fr';
-    const progress = JSON.parse((db.prepare("SELECT value FROM settings WHERE key = 'i18n.progress'").get() as { value: string } | undefined)?.value ?? '{}');
-    const news = listPublished(db, 'news', locale, { limit: 3 });
+    const progress = JSON.parse((await db.get("SELECT value FROM settings WHERE key = 'i18n.progress'") as { value: string } | undefined)?.value ?? '{}');
+    const news = await listPublished(db, 'news', locale, { limit: 3 });
     res.json({
       site: {
         name: 'SCP: Mirage Protocol',
-        version: (db.prepare("SELECT value FROM settings WHERE key = 'site.version'").get() as { value: string } | undefined)?.value ?? '1.3',
+        version: (await db.get("SELECT value FROM settings WHERE key = 'site.version'") as { value: string } | undefined)?.value ?? '1.3',
         releaseDate: 'undisclosed',
         releaseLabel: 'Date de sortie non annoncée',
         tagline: 'Jeu PC en développement — univers SCP. Modes Histoire et Multijoueur sur la même carte : la Zone Mirage.',
@@ -46,7 +45,6 @@ export function publicRoutes(db: DB): Router {
         progress,
         crowdin: CROWDIN_URL,
       },
-      demoMode: DEMO_MODE,
       turnstileSiteKey: TURNSTILE_SITE_KEY || null,
       nav: [
         { key: 'home', to: '/' },
@@ -65,8 +63,8 @@ export function publicRoutes(db: DB): Router {
     });
   });
 
-  router.get('/i18n', (_req, res) => {
-    const progress = JSON.parse((db.prepare("SELECT value FROM settings WHERE key = 'i18n.progress'").get() as { value: string } | undefined)?.value ?? '{}');
+  router.get('/i18n', async (_req, res) => {
+    const progress = JSON.parse((await db.get("SELECT value FROM settings WHERE key = 'i18n.progress'") as { value: string } | undefined)?.value ?? '{}');
     res.json({
       active: I18N_ACTIVE,
       masked: I18N_MASKED,
@@ -79,7 +77,7 @@ export function publicRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Generic content endpoints (§4, §10)
    * ---------------------------------------------------------------- */
-  router.get('/content/:type', (req, res) => {
+  router.get('/content/:type', async (req, res) => {
     const type = String(req.params.type);
     const allowed = ['news', 'roadmap', 'wiki', 'faq', 'legal', 'map', 'buyer_extras'];
     if (!allowed.includes(type)) return res.status(404).json({ error: 'not_found' });
@@ -87,33 +85,33 @@ export function publicRoutes(db: DB): Router {
     const limit = Math.min(200, Math.max(1, Number(req.query.limit ?? 100) || 100));
     const category = req.query.category ? String(req.query.category) : undefined;
     const search = req.query.q ? normaliseSearch(String(req.query.q)) : undefined;
-    const items = listPublished(db, type, locale, { category, limit, search });
-    res.json({ type, locale, items, categories: categoriesFor(db, type) });
+    const items = await listPublished(db, type, locale, { category, limit, search });
+    res.json({ type, locale, items, categories: await categoriesFor(db, type) });
   });
 
-  router.get('/content/:type/:slug', (req, res) => {
-    const row = findBySlug(db, String(req.params.type), String(req.params.slug));
+  router.get('/content/:type/:slug', async (req, res) => {
+    const row = await findBySlug(db, String(req.params.type), String(req.params.slug));
     if (!row || !isPubliclyVisible(row)) return res.status(404).json({ error: 'not_found' });
     const locale = LOCALES.includes(String(req.query.locale)) ? String(req.query.locale) : 'fr';
-    const item = serialize(db, row, locale);
+    const item = await serialize(db, row, locale);
     res.json({
       item,
       license: row.type === 'wiki' ? WIKI_LICENSE : null,
       related: row.type === 'wiki'
-        ? listPublished(db, 'wiki', locale, { limit: 4 }).filter((x) => x.slug !== row.slug).slice(0, 3)
+        ? (await listPublished(db, 'wiki', locale, { limit: 4 })).filter((x) => x.slug !== row.slug).slice(0, 3)
         : [],
     });
   });
 
   /** Wiki full-text search across titles, summaries and bodies. */
-  router.get('/wiki/search', (req, res) => {
+  router.get('/wiki/search', async (req, res) => {
     const q = normaliseSearch(String(req.query.q ?? ''));
     const locale = LOCALES.includes(String(req.query.locale)) ? String(req.query.locale) : 'fr';
     if (q.length < 2) return res.json({ query: q, results: [] });
-    const rows = db.prepare("SELECT * FROM content WHERE type = 'wiki' AND status = 'published'").all() as ContentRow[];
+    const rows = await db.all("SELECT * FROM content WHERE type = 'wiki' AND status = 'published'") as ContentRow[];
     const results = rows
-      .map((row) => {
-        const item = serialize(db, row, locale);
+      .map(async (row) => {
+        const item = await serialize(db, row, locale);
         const haystack = normaliseSearch(`${item.title} ${item.summary} ${item.body}`);
         if (!haystack.includes(q)) return null;
         const idx = haystack.indexOf(q);
@@ -131,17 +129,17 @@ export function publicRoutes(db: DB): Router {
     res.json({ query: q, results });
   });
 
-  router.get('/wiki/categories', (_req, res) => {
-    res.json({ categories: categoriesFor(db, 'wiki') });
+  router.get('/wiki/categories', async (_req, res) => {
+    res.json({ categories: await categoriesFor(db, 'wiki') });
   });
 
   /* ---------------------------------------------------------------- *
    * Interactive map — §9
    * ---------------------------------------------------------------- */
-  router.get('/map', (_req, res) => {
-    const floors = db.prepare('SELECT * FROM map_floors ORDER BY order_index').all();
-    const nodes = db.prepare('SELECT * FROM map_nodes').all();
-    const edges = db.prepare('SELECT * FROM map_edges').all();
+  router.get('/map', async (_req, res) => {
+    const floors = await db.all('SELECT * FROM map_floors ORDER BY order_index');
+    const nodes = await db.all('SELECT * FROM map_nodes');
+    const edges = await db.all('SELECT * FROM map_edges');
     res.json({
       placeholder: true,
       notice: 'Plans de substitution explicites. Les plans définitifs seront fournis par l’équipe de level design.',
@@ -151,18 +149,18 @@ export function publicRoutes(db: DB): Router {
     });
   });
 
-  router.post('/map/route', (req, res) => {
+  router.post('/map/route', async (req, res) => {
     const from = String(req.body?.from ?? '');
     const to = String(req.body?.to ?? '');
     const clearance = req.body?.clearance ? String(req.body.clearance) : null;
     const maxRank = clearanceRank(clearance);
-    const nodes = db.prepare('SELECT * FROM map_nodes').all() as {
+    const nodes = await db.all('SELECT * FROM map_nodes') as {
       id: string; floor_id: string; code: string; label: string; kind: string; restricted: number; clearance: string | null;
     }[];
-    const edges = db.prepare('SELECT * FROM map_edges').all() as {
+    const edges = await db.all('SELECT * FROM map_edges') as {
       id: string; from_node: string; to_node: string; kind: string; distance: number; restricted: number;
     }[];
-    const floors = db.prepare('SELECT * FROM map_floors').all() as { id: string; label: string; level: number }[];
+    const floors = await db.all('SELECT * FROM map_floors') as { id: string; label: string; level: number }[];
 
     const nodeMap = new Map(nodes.map((n) => [n.id, n]));
     if (!nodeMap.has(from) || !nodeMap.has(to)) return res.status(400).json({ error: 'unknown_node' });
@@ -269,10 +267,8 @@ export function publicRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Community servers — §7
    * ---------------------------------------------------------------- */
-  router.get('/servers', (_req, res) => {
-    const rows = db.prepare(
-      "SELECT * FROM servers WHERE deleted_at IS NULL AND status IN ('active','suspended') AND status <> 'pending'",
-    ).all() as Record<string, any>[];
+  router.get('/servers', async (_req, res) => {
+    const rows = await db.all("SELECT * FROM servers WHERE deleted_at IS NULL AND status IN ('active','suspended') AND status <> 'pending'") as Record<string, any>[];
     const active = rows.filter((r) => r.status === 'active');
     const featured = [...active]
       .sort((a, b) => Math.max(b.validated_at ?? 0, b.created_at) - Math.max(a.validated_at ?? 0, a.created_at))
@@ -308,18 +304,16 @@ export function publicRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Leaderboards & public stats — §5.7
    * ---------------------------------------------------------------- */
-  router.get('/leaderboards', (req, res) => {
+  router.get('/leaderboards', async (req, res) => {
     const mode = req.query.mode === 'multiplayer' ? 'multiplayer' : 'story';
     const operation = req.query.operation ? String(req.query.operation) : null;
     const ending = req.query.ending ? String(req.query.ending) : null;
 
-    const rows = db.prepare(
-      `SELECT s.*, u.username, u.profile_public, u.mirage_id
+    const rows = await db.all(`SELECT s.*, u.username, u.profile_public, u.mirage_id
        FROM stat_entries s LEFT JOIN users u ON u.id = s.user_id
        WHERE s.mode = ? AND s.hidden = 0 AND (s.user_id IS NULL OR u.profile_public = 1)
        ${operation ? 'AND s.operation_code = ?' : ''}
-       ${ending ? 'AND s.ending_code = ?' : ''}`,
-    ).all(...[mode, ...(operation ? [operation] : []), ...(ending ? [ending] : [])]) as Record<string, any>[];
+       ${ending ? 'AND s.ending_code = ?' : ''}`, [...[mode, ...(operation ? [operation] : []), ...(ending ? [ending] : [])]]) as Record<string, any>[];
 
     const shaped = rows.map((r) => ({
       displayName: r.username ?? r.display_name,
@@ -365,11 +359,11 @@ export function publicRoutes(db: DB): Router {
     });
   });
 
-  router.get('/stats/global', (_req, res) => {
-    const users = db.prepare("SELECT COUNT(*) AS c FROM users WHERE status = 'active' AND role = 'player'").get() as { c: number };
-    const servers = db.prepare("SELECT COUNT(*) AS c FROM servers WHERE status = 'active' AND deleted_at IS NULL").get() as { c: number };
-    const wiki = db.prepare("SELECT COUNT(*) AS c FROM content WHERE type = 'wiki' AND status = 'published'").get() as { c: number };
-    const news = db.prepare("SELECT COUNT(*) AS c FROM content WHERE type = 'news' AND status = 'published'").get() as { c: number };
+  router.get('/stats/global', async (_req, res) => {
+    const users = await db.get("SELECT COUNT(*) AS c FROM users WHERE status = 'active' AND role = 'player'") as { c: number };
+    const servers = await db.get("SELECT COUNT(*) AS c FROM servers WHERE status = 'active' AND deleted_at IS NULL") as { c: number };
+    const wiki = await db.get("SELECT COUNT(*) AS c FROM content WHERE type = 'wiki' AND status = 'published'") as { c: number };
+    const news = await db.get("SELECT COUNT(*) AS c FROM content WHERE type = 'news' AND status = 'published'") as { c: number };
     res.json({
       players: users.c,
       servers: servers.c,
@@ -383,8 +377,8 @@ export function publicRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Storefront — §8 (no payment, no launcher)
    * ---------------------------------------------------------------- */
-  router.get('/store', (_req, res) => {
-    const extras = listPublished(db, 'buyer_extras', 'fr');
+  router.get('/store', async (_req, res) => {
+    const extras = await listPublished(db, 'buyer_extras', 'fr');
     res.json({
       editions: [
         {
@@ -434,8 +428,8 @@ export function publicRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Maintenance & legal
    * ---------------------------------------------------------------- */
-  router.get('/maintenance', (_req, res) => {
-    const setting = db.prepare("SELECT value FROM settings WHERE key = 'maintenance.enabled'").get() as { value: string } | undefined;
+  router.get('/maintenance', async (_req, res) => {
+    const setting = await db.get("SELECT value FROM settings WHERE key = 'maintenance.enabled'") as { value: string } | undefined;
     res.json({
       enabled: setting?.value === 'true',
       message: 'Aucune maintenance planifiée. Les créneaux seront annoncés par l’équipe technique.',
@@ -444,19 +438,18 @@ export function publicRoutes(db: DB): Router {
     });
   });
 
-  router.get('/legal/:slug', (req, res) => {
-    const row = findBySlug(db, 'legal', String(req.params.slug));
+  router.get('/legal/:slug', async (req, res) => {
+    const row = await findBySlug(db, 'legal', String(req.params.slug));
     if (!row || !isPubliclyVisible(row)) return res.status(404).json({ error: 'not_found' });
-    res.json({ item: serialize(db, row, String(req.query.locale ?? 'fr')) });
+    res.json({ item: await serialize(db, row, String(req.query.locale ?? 'fr')) });
   });
 
   /* ---------------------------------------------------------------- *
    * Public profile — §5.6
    * ---------------------------------------------------------------- */
-  router.get('/profile/:mirageId', (req, res) => {
+  router.get('/profile/:mirageId', async (req, res) => {
     const mirageId = String(req.params.mirageId);
-    const user = db.prepare('SELECT * FROM users WHERE mirage_id = ? AND (purge_after IS NULL OR purge_after > ?)')
-      .get(mirageId, Date.now()) as PublicUser | undefined;
+    const user = await db.get('SELECT * FROM users WHERE mirage_id = ? AND (purge_after IS NULL OR purge_after > ?)', [mirageId, Date.now()]) as PublicUser | undefined;
     if (!user) return res.status(404).json({ error: 'not_found', message: 'Profil introuvable.' });
     const viewer = req.user?.id ?? null;
     const isOwner = viewer === user.id;
@@ -470,7 +463,7 @@ export function publicRoutes(db: DB): Router {
     if (!isOwner && !isPublic) {
       return res.json({ profile: base, stats: null, socials: null });
     }
-    const stats = statsFor(db, user.id);
+    const stats = await statsFor(db, user.id);
     const socials = JSON.parse(user.socials_json || '{}');
     res.json({
       profile: {
@@ -514,7 +507,7 @@ export function publicRoutes(db: DB): Router {
   });
 
   /* ---------------------------------------------------------------- *
-   * Demos/health
+   * Healthcheck
    * ---------------------------------------------------------------- */
   router.get('/health', (_req, res) => {
     res.json({ status: 'ok', env: IS_PROD ? 'production' : 'development', time: Date.now() });
@@ -526,8 +519,6 @@ export function publicRoutes(db: DB): Router {
 }
 
 export const publicConfig = {
-  demoMode: DEMO_MODE,
-  totpPreview: DEMO_MODE ? DEMO_TOTP_SECRET : null,
   locales: LOCALES,
   standardPrice: STORE_STANDARD_PRICE,
   rateKey: (ip: string) => sha256(ip),

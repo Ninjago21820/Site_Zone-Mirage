@@ -1,6 +1,6 @@
 import { Router, type Request } from 'express';
 import type { DB } from '../db.js';
-import { OFFLINE_GRACE_MS, DEMO_MODE } from '../config.js';
+import { OFFLINE_GRACE_MS } from '../config.js';
 import {
   ensureSigningKey, publicSigningKeys, signLicenseToken, verifyLicenseToken,
   issueSessionTicket, consumeSessionTicket, verifyStatsSignature,
@@ -22,20 +22,20 @@ interface LicenseAuth {
   reason?: string;
 }
 
-function readLicense(req: Request, db: DB): LicenseAuth {
+async function readLicense(req: Request, db: DB): Promise<LicenseAuth> {
   const header = req.get('authorization') ?? '';
   const token = header.replace(/^License\s+/i, '').trim();
   if (!token) return { ok: false, reason: 'missing_token' };
-  const result = verifyLicenseToken(db, token);
+  const result = await verifyLicenseToken(db, token);
   if (!result.valid) return { ok: false, reason: result.reason };
   return { ok: true, claims: result.claims as unknown as Record<string, any> };
 }
 
-function serverAuth(db: DB, req: Request): { ok: boolean; serverId?: string } {
+async function serverAuth(db: DB, req: Request): Promise<{ ok: boolean; serverId?: string }> {
   const serverId = String(req.get('x-server-id') ?? req.body?.serverId ?? '');
   const signature = String(req.get('x-signature') ?? req.body?.signature ?? '');
   if (!serverId) return { ok: false };
-  const server = db.prepare('SELECT id, status FROM servers WHERE id = ? AND deleted_at IS NULL').get(serverId) as
+  const server = await db.get('SELECT id, status FROM servers WHERE id = ? AND deleted_at IS NULL', [serverId]) as
     | { id: string; status: string }
     | undefined;
   if (!server) return { ok: false };
@@ -49,8 +49,8 @@ function serverAuth(db: DB, req: Request): { ok: boolean; serverId?: string } {
 export function apiV1Routes(db: DB): Router {
   const router = Router();
 
-  router.get('/config', (_req, res) => {
-    ensureSigningKey(db);
+  router.get('/config', async (_req, res) => {
+    await ensureSigningKey(db);
     res.json({
       apiVersion: '1.0',
       game: { name: 'SCP: Mirage Protocol', releaseDate: null, releaseLabel: 'Date de sortie non annoncée' },
@@ -59,15 +59,14 @@ export function apiV1Routes(db: DB): Router {
       sessionTicketTtlSeconds: 60,
       statsSyncIntervalHours: 24,
       maxServersPerAccount: 3,
-      demoMode: DEMO_MODE,
       discordCommands: DISCORD_COMMANDS,
     });
   });
 
   /** Public keys for offline licence-token verification in the game client. */
-  router.get('/keys', (_req, res) => {
-    ensureSigningKey(db);
-    res.json({ keys: publicSigningKeys(db).filter((k) => !k.revoked) });
+  router.get('/keys', async (_req, res) => {
+    await ensureSigningKey(db);
+    res.json({ keys: (await publicSigningKeys(db)).filter((k) => !k.revoked) });
   });
 
   /**
@@ -86,10 +85,10 @@ export function apiV1Routes(db: DB): Router {
     const ownership = await verifyOwnership(provider, proof);
     const mirageId = body.mirageId ? String(body.mirageId) : null;
     const user = mirageId
-      ? (db.prepare('SELECT * FROM users WHERE mirage_id = ?').get(mirageId) as PublicUser | undefined)
+      ? (await db.get('SELECT * FROM users WHERE mirage_id = ?', [mirageId]) as PublicUser | undefined)
       : undefined;
 
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: user?.id ?? null, actorRole: user?.role ?? null, action: 'license.verified',
       targetType: 'license', targetId: mirageId, ipTrunc: req.ipTrunc,
       meta: { provider, status: ownership.status, error: ownership.error ?? null },
@@ -109,7 +108,7 @@ export function apiV1Routes(db: DB): Router {
 
     if (ownership.status === 'unavailable') {
       // Platform timeout: no sanction, Story grace applies.
-      const { token, claims } = signLicenseToken(db, {
+      const { token, claims } = await signLicenseToken(db, {
         sub: user?.id ?? 'anonymous',
         mid: user?.mirage_id ?? mirageId ?? '',
         provider,
@@ -134,7 +133,7 @@ export function apiV1Routes(db: DB): Router {
     }
 
     const scope: ('story' | 'online')[] = ownership.status === 'shared' ? ['story', 'online'] : ['story', 'online'];
-    const { token, claims } = signLicenseToken(db, {
+    const { token, claims } = await signLicenseToken(db, {
       sub: user?.id ?? 'anonymous',
       mid: user?.mirage_id ?? mirageId ?? '',
       provider,
@@ -161,21 +160,21 @@ export function apiV1Routes(db: DB): Router {
     });
   });
 
-  router.post('/licenses/decode', (req, res) => {
+  router.post('/licenses/decode', async (req, res) => {
     const token = String(req.body?.token ?? '');
-    const result = verifyLicenseToken(db, token);
+    const result = await verifyLicenseToken(db, token);
     res.status(result.valid ? 200 : 400).json(result);
   });
 
   /** §5.5 — single-use, short-lived, server-bound session ticket. */
-  router.post('/session-tickets', (req, res) => {
-    const auth = readLicense(req, db);
+  router.post('/session-tickets', async (req, res) => {
+    const auth = await readLicense(req, db);
     if (!auth.ok) return res.status(401).json({ error: 'invalid_license', reason: auth.reason });
     if (!Array.isArray(auth.claims?.scope) || !auth.claims!.scope.includes('online')) {
       return res.status(403).json({ error: 'online_not_allowed', message: 'Cette licence n’autorise pas les fonctionnalités en ligne.' });
     }
     const serverId = String(req.body?.serverId ?? '');
-    const server = db.prepare("SELECT id, status, maintenance FROM servers WHERE id = ? AND deleted_at IS NULL").get(serverId) as
+    const server = await db.get("SELECT id, status, maintenance FROM servers WHERE id = ? AND deleted_at IS NULL", [serverId]) as
       | { id: string; status: string; maintenance: number }
       | undefined;
     if (!server || server.status !== 'active') return res.status(404).json({ error: 'server_unavailable' });
@@ -183,21 +182,21 @@ export function apiV1Routes(db: DB): Router {
     const userId = String(auth.claims?.sub ?? '');
     if (!userId || userId === 'anonymous') return res.status(409).json({ error: 'account_required', message: 'Un compte lié est requis pour le mode Multijoueur.' });
 
-    const ticket = issueSessionTicket(db, userId, serverId);
-    appendAudit(db, {
+    const ticket = await issueSessionTicket(db, userId, serverId);
+    await appendAudit(db, {
       actorId: userId, actorRole: 'player', action: 'session.ticket_issued', targetType: 'server',
       targetId: serverId, ipTrunc: req.ipTrunc,
     });
     res.json(ticket);
   });
 
-  router.post('/session-tickets/redeem', (req, res) => {
-    const auth = serverAuth(db, req);
+  router.post('/session-tickets/redeem', async (req, res) => {
+    const auth = await serverAuth(db, req);
     if (!auth.ok) return res.status(401).json({ error: 'invalid_server_signature' });
     const ticket = String(req.body?.ticket ?? '');
-    const result = consumeSessionTicket(db, ticket, auth.serverId!);
+    const result = await consumeSessionTicket(db, ticket, auth.serverId!);
     if (!result.ok) {
-      appendAudit(db, {
+      await appendAudit(db, {
         actorId: null, actorRole: null, action: 'session.ticket_rejected', targetType: 'server',
         targetId: auth.serverId!, ipTrunc: req.ipTrunc, meta: { reason: result.reason },
       });
@@ -207,8 +206,8 @@ export function apiV1Routes(db: DB): Router {
   });
 
   /** §5.7 — signed stats synchronisation from a validated game server. */
-  router.post('/stats/sync', (req, res) => {
-    const auth = serverAuth(db, req);
+  router.post('/stats/sync', async (req, res) => {
+    const auth = await serverAuth(db, req);
     if (!auth.ok) return res.status(401).json({ error: 'invalid_server_signature' });
     const entries = Array.isArray(req.body?.entries) ? req.body.entries.slice(0, 500) : [];
     const now = Date.now();
@@ -231,7 +230,7 @@ export function apiV1Routes(db: DB): Router {
         continue;
       }
       const user = raw.mirageId
-        ? (db.prepare('SELECT id FROM users WHERE mirage_id = ?').get(String(raw.mirageId)) as { id: string } | undefined)
+        ? (await db.get('SELECT id FROM users WHERE mirage_id = ?', [String(raw.mirageId)]) as { id: string } | undefined)
         : undefined;
       const bestTime = raw.bestTimeMs != null ? Math.trunc(Number(raw.bestTimeMs)) : null;
       if (bestTime !== null && (bestTime <= 1000 || bestTime > 86400000)) {
@@ -244,54 +243,46 @@ export function apiV1Routes(db: DB): Router {
       const score = Math.max(0, Math.min(100_000, Number(raw.score ?? 0)));
       const ending = raw.ending ? String(raw.ending).slice(0, 24) : null;
 
-      const existing = db.prepare(
-        'SELECT * FROM stat_entries WHERE user_id = ? AND mode = ? AND operation_code = ?',
-      ).get(user?.id ?? null, mode, operation) as Record<string, any> | undefined;
+      const existing = await db.get('SELECT * FROM stat_entries WHERE user_id = ? AND mode = ? AND operation_code = ?', [user?.id ?? null, mode, operation]) as Record<string, any> | undefined;
 
       if (existing) {
         const betterTime = bestTime !== null && (existing.best_time_ms === null || bestTime < existing.best_time_ms);
-        db.prepare(`UPDATE stat_entries SET ending_code = COALESCE(?, ending_code), best_time_ms = ?, deaths = ?,
-          reputation = ?, playtime_ms = ?, score = ?, verified_at = ?, updated_at = ? WHERE id = ?`)
-          .run(ending, betterTime ? bestTime : existing.best_time_ms, deaths, reputation, playtime, score, now, now, existing.id);
+        await db.run(`UPDATE stat_entries SET ending_code = COALESCE(?, ending_code), best_time_ms = ?, deaths = ?,
+          reputation = ?, playtime_ms = ?, score = ?, verified_at = ?, updated_at = ? WHERE id = ?`, [ending, betterTime ? bestTime : existing.best_time_ms, deaths, reputation, playtime, score, now, now, existing.id]);
       } else {
-        db.prepare(`INSERT INTO stat_entries
+        await db.run(`INSERT INTO stat_entries
           (id,user_id,display_name,mode,operation_code,ending_code,best_time_ms,deaths,reputation,playtime_ms,score,hidden,verified_at,updated_at)
-          VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?)`)
-          .run(newId('st'), user?.id ?? null, raw.displayName ? String(raw.displayName).slice(0, 40) : 'Anonyme',
-            mode, operation, ending, bestTime, deaths, reputation, playtime, score, now, now);
+          VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?,?)`, [newId('st'), user?.id ?? null, raw.displayName ? String(raw.displayName).slice(0, 40) : 'Anonyme', mode, operation, ending, bestTime, deaths, reputation, playtime, score, now, now]);
       }
       accepted++;
     }
 
-    db.prepare('UPDATE servers SET last_online_at = ? WHERE id = ?').run(now, auth.serverId!);
-    appendAudit(db, {
+    await db.run('UPDATE servers SET last_online_at = ? WHERE id = ?', [now, auth.serverId!]);
+    await appendAudit(db, {
       actorId: null, actorRole: 'server', action: 'stats.synced', targetType: 'server',
       targetId: auth.serverId!, ipTrunc: req.ipTrunc, meta: { accepted, rejected: rejected.length },
     });
     res.json({ ok: true, accepted, rejected, syncedAt: now, nextSyncBefore: now + 24 * 3600 * 1000 });
   });
 
-  router.post('/servers/heartbeat', (req, res) => {
-    const auth = serverAuth(db, req);
+  router.post('/servers/heartbeat', async (req, res) => {
+    const auth = await serverAuth(db, req);
     if (!auth.ok) return res.status(401).json({ error: 'invalid_server_signature' });
     const current = Math.max(0, Math.trunc(Number(req.body?.currentPlayers ?? 0)));
     const avg = Math.max(0, Number(req.body?.avgPlayers ?? current));
     const max = Math.max(1, Math.trunc(Number(req.body?.maxPlayers ?? 24)));
-    const row = db.prepare('SELECT avg_players FROM servers WHERE id = ?').get(auth.serverId!) as { avg_players: number };
+    const row = await db.get('SELECT avg_players FROM servers WHERE id = ?', [auth.serverId!]) as { avg_players: number };
     const smoothed = row.avg_players > 0 ? row.avg_players * 0.8 + avg * 0.2 : avg;
-    db.prepare('UPDATE servers SET current_players = ?, avg_players = ?, max_players = ?, last_online_at = ? WHERE id = ?')
-      .run(current, Math.round(smoothed * 100) / 100, max, Date.now(), auth.serverId!);
+    await db.run('UPDATE servers SET current_players = ?, avg_players = ?, max_players = ?, last_online_at = ? WHERE id = ?', [current, Math.round(smoothed * 100) / 100, max, Date.now(), auth.serverId!]);
     res.json({ ok: true });
   });
 
-  router.get('/leaderboards', (req, res) => {
+  router.get('/leaderboards', async (req, res) => {
     const mode = req.query.mode === 'multiplayer' ? 'multiplayer' : 'story';
-    const rows = db.prepare(
-      `SELECT s.*, u.username, u.profile_public FROM stat_entries s
+    const rows = await db.all(`SELECT s.*, u.username, u.profile_public FROM stat_entries s
        LEFT JOIN users u ON u.id = s.user_id
        WHERE s.mode = ? AND s.hidden = 0 AND (s.user_id IS NULL OR u.profile_public = 1)
-       ORDER BY s.best_time_ms IS NULL, s.best_time_ms ASC LIMIT 100`,
-    ).all(mode) as Record<string, any>[];
+       ORDER BY s.best_time_ms IS NULL, s.best_time_ms ASC LIMIT 100`, [mode]) as Record<string, any>[];
     res.json({
       mode,
       entries: rows.map((r) => ({
@@ -311,7 +302,7 @@ export function apiV1Routes(db: DB): Router {
   /* ------------------------------------------------------------------ *
    * Discord interactions (Ed25519) — §12.3
    * ------------------------------------------------------------------ */
-  router.post('/discord/interactions', (req, res) => {
+  router.post('/discord/interactions', async (req, res) => {
     const raw = (req as Request & { rawBody?: Buffer }).rawBody;
     const valid = verifyDiscordSignature({
       publicKeyHex: process.env.DISCORD_PUBLIC_KEY,
@@ -326,7 +317,7 @@ export function apiV1Routes(db: DB): Router {
       }
       return res.status(401).json({ error: 'invalid_signature' });
     }
-    const result = handleInteraction(db, req.body ?? {}, req.get('x-interaction-id') ?? undefined);
+    const result = await handleInteraction(db, req.body ?? {}, req.get('x-interaction-id') ?? undefined);
     res.status(result.status).json(result.body);
   });
 

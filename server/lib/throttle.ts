@@ -35,12 +35,12 @@ function get(key: string, now: number): Bucket {
   return bucket;
 }
 
-export function failureCount(key: string, now = Date.now()): number {
-  return get(key, now).failures.length;
+export async function failureCount(key: string, now = Date.now()): Promise<number> {
+  return await get(key, now).failures.length;
 }
 
-export function recordFailure(key: string, now = Date.now()) {
-  const bucket = get(key, now);
+export async function recordFailure(key: string, now = Date.now()) {
+  const bucket = await get(key, now);
   bucket.failures.push(now);
   if (bucket.failures.length > 200) bucket.failures = bucket.failures.slice(-200);
 }
@@ -49,16 +49,16 @@ export function clearFailures(key: string) {
   buckets.delete(key);
 }
 
-export function delayFor(key: string, now = Date.now()): number {
-  const { failures } = get(key, now);
+export async function delayFor(key: string, now = Date.now()): Promise<number> {
+  const { failures } = await get(key, now);
   const n = failures.length;
   if (n < THRESHOLD) return 0;
   const exponent = Math.min(20, n - THRESHOLD);
   return Math.min(THROTTLE.maxDelayMs, THROTTLE.baseDelayMs * 2 ** exponent);
 }
 
-export function requiresChallenge(key: string, now = Date.now()): boolean {
-  return get(key, now).failures.length >= THROTTLE.challengeAfter;
+export async function requiresChallenge(key: string, now = Date.now()): Promise<boolean> {
+  return await get(key, now).failures.length >= THROTTLE.challengeAfter;
 }
 
 export const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, Math.max(0, ms)));
@@ -66,7 +66,8 @@ export const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(r
 /** Small constant floor so success and failure paths cost a comparable amount of time. */
 export async function applyLoginDelay(keys: string[], extraFloorMs = 120) {
   const now = Date.now();
-  const delay = Math.max(extraFloorMs, ...keys.map((k) => delayFor(k, now)));
+  const delays = await Promise.all(keys.map((key) => delayFor(key, now)));
+  const delay = Math.max(extraFloorMs, ...delays);
   if (delay > 0) await sleep(delay);
 }
 

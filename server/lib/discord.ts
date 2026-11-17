@@ -38,13 +38,13 @@ const ephemeral = (content: string): InteractionResponse => ({
   body: { type: 4, data: { content, flags: 64 } },
 });
 
-export function handleInteraction(db: DB, payload: Record<string, any>, interactionId?: string): InteractionResponse {
+export async function handleInteraction(db: DB, payload: Record<string, any>, interactionId?: string): Promise<InteractionResponse> {
   if (payload?.type === 1) return { status: 200, body: { type: 1 } };
   if (payload?.type === 2) {
     if (interactionId) {
-      const seen = db.prepare('SELECT 1 AS hit FROM discord_interactions WHERE id = ?').get(interactionId);
+      const seen = await db.get('SELECT 1 AS hit FROM discord_interactions WHERE id = ?', [interactionId]);
       if (seen) return ephemeral('Cette interaction a déjà été traitée.');
-      db.prepare('INSERT INTO discord_interactions (id, received_at) VALUES (?,?)').run(interactionId, Date.now());
+      await db.run('INSERT INTO discord_interactions (id, received_at) VALUES (?,?)', [interactionId, Date.now()]);
     }
     const name = String(payload.data?.name ?? '');
     if (name === 'statut') {
@@ -55,9 +55,7 @@ export function handleInteraction(db: DB, payload: Record<string, any>, interact
       );
     }
     if (name === 'serveurs') {
-      const rows = db.prepare(
-        "SELECT name, current_players, max_players FROM servers WHERE status = 'active' AND deleted_at IS NULL ORDER BY avg_players DESC LIMIT 5",
-      ).all() as { name: string; current_players: number; max_players: number }[];
+      const rows = await db.all("SELECT name, current_players, max_players FROM servers WHERE status = 'active' AND deleted_at IS NULL ORDER BY avg_players DESC LIMIT 5") as { name: string; current_players: number; max_players: number }[];
       if (!rows.length) return ephemeral('Aucun serveur communautaire publié pour le moment.');
       return ephemeral(
         `**Serveurs communautaires (top 5)**\n${rows.map((r) => `• ${r.name} — ${r.current_players}/${r.max_players}`).join('\n')}`,
@@ -65,10 +63,8 @@ export function handleInteraction(db: DB, payload: Record<string, any>, interact
     }
     if (name === 'wiki') {
       const query = String(payload.data?.options?.find((o: any) => o.name === 'recherche')?.value ?? '').toLowerCase();
-      const rows = db.prepare(
-        `SELECT c.slug, t.title FROM content c JOIN content_translations t ON t.content_id = c.id AND t.locale = 'fr'
-         WHERE c.type = 'wiki' AND c.status = 'published' AND lower(t.title) LIKE ? LIMIT 5`,
-      ).all(`%${query}%`) as { slug: string; title: string }[];
+      const rows = await db.all(`SELECT c.slug, t.title FROM content c JOIN content_translations t ON t.content_id = c.id AND t.locale = 'fr'
+         WHERE c.type = 'wiki' AND c.status = 'published' AND lower(t.title) LIKE ? LIMIT 5`, [`%${query}%`]) as { slug: string; title: string }[];
       if (!rows.length) return ephemeral('Aucun résultat dans le Wiki.');
       return ephemeral(`**Résultats Wiki**\n${rows.map((r) => `• ${r.title} — /wiki/${r.slug}`).join('\n')}`);
     }

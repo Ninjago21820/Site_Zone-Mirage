@@ -1,4 +1,4 @@
-import { DEMO_MODE } from '../config.js';
+import { PLATFORM_FIXTURES } from '../config.js';
 
 /**
  * §5.4 — platform ownership verification.
@@ -47,9 +47,9 @@ export async function verifyOwnership(provider: PlatformProvider, proof: string)
   const appId = APP_IDS[provider];
   const timeoutMs = Number(process.env.PLATFORM_TIMEOUT_MS ?? 4000);
 
-  if (DEMO_MODE || process.env.PLATFORM_MODE === 'demo') {
-    // Deterministic demo proofs keep the integration testable end-to-end.
-    // `demo-authored-<account>` is never accepted as a valid ownership proof.
+  // Jeu de réponses déterministe, réservé aux tests d'intégration hors
+  // production (PLATFORM_MODE=fixture). Aucun chemin de ce type en production.
+  if (PLATFORM_FIXTURES) {
     const value = String(proof ?? '');
     if (!value.startsWith('demo-proof-')) {
       return { status: 'unowned', provider, appId, error: 'invalid_proof' };

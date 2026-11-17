@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   harness, newClient, loginStaff, loginPlayer, resetTotp, extractCookie, rid,
-  STAFF_PASSWORD, PLAYER_PASSWORD, type Harness, DEMO_TOTP_SECRET,
+  STAFF_PASSWORD, PLAYER_PASSWORD, type Harness, FIXTURE_TOTP_SECRET,
 } from './helpers.js';
 import { verifyAuditChain } from '../server/lib/audit.js';
 import { createBackup, verifyBackup } from '../server/lib/backup.js';
@@ -26,7 +26,7 @@ beforeEach(async () => {
 describe('§5.2 — Mirage ID', () => {
   it('respecte le format MIRAGE:A.BB.<18 chiffres>', async () => {
     const { db } = h;
-    const rows = db.prepare('SELECT mirage_id FROM users').all() as { mirage_id: string }[];
+    const rows = await db.all('SELECT mirage_id FROM users') as { mirage_id: string }[];
     expect(rows.length).toBeGreaterThan(5);
     for (const row of rows) {
       expect(row.mirage_id).toMatch(/^MIRAGE:[0-9]\.[0-9]{2}\.[0-9]{18}$/);
@@ -35,9 +35,9 @@ describe('§5.2 — Mirage ID', () => {
 
   it('réserve définitivement un identifiant après suppression du compte', async () => {
     const { db } = h;
-    const user = db.prepare("SELECT id, mirage_id FROM users WHERE username = 'recrue'").get() as { id: string; mirage_id: string };
-    db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
-    const reserved = db.prepare('SELECT 1 AS hit FROM reserved_mirage_ids WHERE mirage_id = ?').get(user.mirage_id);
+    const user = await db.get("SELECT id, mirage_id FROM users WHERE username = 'recrue'") as { id: string; mirage_id: string };
+    await db.run('DELETE FROM users WHERE id = ?', [user.id]);
+    const reserved = await db.get('SELECT 1 AS hit FROM reserved_mirage_ids WHERE mirage_id = ?', [user.mirage_id]);
     expect(reserved).toBeTruthy();
   });
 });
@@ -68,7 +68,7 @@ describe('§6.3 / critère #1 — Politique de mots de passe', () => {
       username, email: `${username}@example.org`, password: 'Vault-Protocol-77!x',
     });
     expect(res.status).toBe(201);
-    const row = h.db.prepare('SELECT password_hash FROM users WHERE username = ?').get(username) as { password_hash: string };
+    const row = await h.db.get('SELECT password_hash FROM users WHERE username = ?', [username]) as { password_hash: string };
     expect(row.password_hash.startsWith('$argon2id$')).toBe(true);
   });
 });
@@ -118,7 +118,7 @@ describe('§6.7 / critère #8 — Délai progressif sans verrouillage', () => {
 describe('§6.4 / critère #2 — Double authentification du personnel', () => {
   it('exige un second facteur avant d’ouvrir une session staff', async () => {
     const client = await newClient(h.app);
-    resetTotp(h.db, 'admin');
+    await resetTotp(h.db, 'admin');
     const step1 = await client.post('/api/auth/login', { identifier: 'admin', password: STAFF_PASSWORD });
     expect(step1.status).toBe(200);
     expect(step1.body.mfaRequired).toBe(true);
@@ -127,7 +127,7 @@ describe('§6.4 / critère #2 — Double authentification du personnel', () => {
     expect(blocked.status).toBe(403);
     expect(blocked.body.error).toBe('mfa_required');
 
-    const ok = await client.post('/api/auth/login/2fa', { code: totpAt(DEMO_TOTP_SECRET) });
+    const ok = await client.post('/api/auth/login/2fa', { code: totpAt(FIXTURE_TOTP_SECRET) });
     expect(ok.status).toBe(200);
     const session = await client.get('/api/backoffice/session');
     expect(session.status).toBe(200);
@@ -136,9 +136,9 @@ describe('§6.4 / critère #2 — Double authentification du personnel', () => {
 
   it('refuse un code TOTP rejoué dans la même fenêtre', async () => {
     const client = await newClient(h.app);
-    resetTotp(h.db, 'moderator');
+    await resetTotp(h.db, 'moderator');
     await client.post('/api/auth/login', { identifier: 'moderator', password: STAFF_PASSWORD });
-    const code = totpAt(DEMO_TOTP_SECRET);
+    const code = totpAt(FIXTURE_TOTP_SECRET);
     const first = await client.post('/api/auth/login/2fa', { code });
     expect(first.status).toBe(200);
 
@@ -163,7 +163,7 @@ describe('§6.4 / critère #2 — Double authentification du personnel', () => {
     const start = await client.get('/api/auth/oauth/discord/start');
     const res = await client.get(`/api/auth/oauth/discord/callback?state=${start.body.state}&code=abc123`);
     expect(res.status).toBe(302);
-    const created = h.db.prepare("SELECT role FROM users ORDER BY created_at DESC, rowid DESC LIMIT 1").get() as { role: string };
+    const created = await h.db.get("SELECT role FROM users ORDER BY created_at DESC, rowid DESC LIMIT 1") as { role: string };
     expect(created.role).toBe('player');
   });
 });
@@ -171,16 +171,16 @@ describe('§6.4 / critère #2 — Double authentification du personnel', () => {
 describe('§6.6 / critère #3 — Aucune liaison automatique par e-mail', () => {
   it('crée un nouveau compte au lieu de lier un compte existant', async () => {
     const { db } = h;
-    const before = (db.prepare('SELECT COUNT(*) AS c FROM users').get() as { c: number }).c;
-    const existing = db.prepare("SELECT id FROM users WHERE username = 'joueur'").get() as { id: string };
+    const before = (await db.get('SELECT COUNT(*) AS c FROM users') as { c: number }).c;
+    const existing = await db.get("SELECT id FROM users WHERE username = 'joueur'") as { id: string };
     const client = await newClient(h.app);
     const start = await client.get('/api/auth/oauth/steam/start');
     const callback = await client.get(`/api/auth/oauth/steam/callback?state=${start.body.state}&code=steam-code`);
     expect(callback.status).toBe(302);
     expect(callback.headers.location).toContain('needsEmail=1');
-    const after = (db.prepare('SELECT COUNT(*) AS c FROM users').get() as { c: number }).c;
+    const after = (await db.get('SELECT COUNT(*) AS c FROM users') as { c: number }).c;
     expect(after).toBe(before + 1);
-    const linked = db.prepare("SELECT 1 AS hit FROM oauth_identities WHERE user_id = ?").get(existing.id);
+    const linked = await db.get("SELECT 1 AS hit FROM oauth_identities WHERE user_id = ?", [existing.id]);
     expect(linked).toBeUndefined();
   });
 
@@ -197,26 +197,26 @@ describe('§6.10 / critère #4 — Jetons de réinitialisation', () => {
     const client = await newClient(h.app);
     const first = await client.post('/api/auth/password/forgot', { email: 'joueur@mirage-protocol.example' });
     const second = await client.post('/api/auth/password/forgot', { email: 'joueur@mirage-protocol.example' });
-    expect(second.body.demoToken).toBeTruthy();
+    expect(second.body.testToken).toBeTruthy();
 
-    const stale = await client.post('/api/auth/password/reset', { token: first.body.demoToken, password: 'Nouveau-Vault-2026!' });
+    const stale = await client.post('/api/auth/password/reset', { token: first.body.testToken, password: 'Nouveau-Vault-2026!' });
     expect(stale.status).toBe(400);
 
-    const ok = await client.post('/api/auth/password/reset', { token: second.body.demoToken, password: 'Nouveau-Vault-2026!' });
+    const ok = await client.post('/api/auth/password/reset', { token: second.body.testToken, password: 'Nouveau-Vault-2026!' });
     expect(ok.status).toBe(200);
     expect(ok.body.twoFactorStillRequired).toBe(false);
 
-    const reuse = await client.post('/api/auth/password/reset', { token: second.body.demoToken, password: 'Autre-Vault-2026!' });
+    const reuse = await client.post('/api/auth/password/reset', { token: second.body.testToken, password: 'Autre-Vault-2026!' });
     expect(reuse.status).toBe(400);
 
-    const token = db.prepare('SELECT expires_at, created_at FROM password_reset_tokens ORDER BY created_at DESC LIMIT 1').get() as { expires_at: number; created_at: number };
+    const token = await db.get('SELECT expires_at, created_at FROM password_reset_tokens ORDER BY created_at DESC LIMIT 1') as { expires_at: number; created_at: number };
     expect(token.expires_at - token.created_at).toBe(30 * 60 * 1000);
   });
 
   it('conserve l’obligation de 2FA après réinitialisation pour un compte staff', async () => {
     const client = await newClient(h.app);
     const forgot = await client.post('/api/auth/password/forgot', { email: 'admin@mirage-protocol.example' });
-    const reset = await client.post('/api/auth/password/reset', { token: forgot.body.demoToken, password: 'Vault-Cadmium-2026!' });
+    const reset = await client.post('/api/auth/password/reset', { token: forgot.body.testToken, password: 'Vault-Cadmium-2026!' });
     expect(reset.status).toBe(200);
     expect(reset.body.twoFactorStillRequired).toBe(true);
     const login = await client.post('/api/auth/login', { identifier: 'admin', password: 'Vault-Cadmium-2026!' });
@@ -247,7 +247,7 @@ describe('§6.8 / critère #6 — Révocation des sessions', () => {
   it('exige une réauthentification récente pour une action sensible', async () => {
     const a = await newClient(h.app);
     await loginPlayer(a);
-    h.db.prepare("UPDATE users SET reauth_at = 0 WHERE username = 'joueur'").run();
+    await h.db.run("UPDATE users SET reauth_at = 0 WHERE username = 'joueur'");
     const blocked = await a.post('/api/auth/password/change', {
       currentPassword: PLAYER_PASSWORD, newPassword: 'Autre-Vault-2026!x',
     });
@@ -309,7 +309,7 @@ describe('§6.9 / critère #7 — Contrôles d’accès serveur', () => {
   it('limite le Community Manager aux avertissements', async () => {
     const cm = await newClient(h.app);
     await loginStaff(cm, h.db, 'community_manager');
-    const target = h.db.prepare("SELECT id FROM users WHERE username = 'recrue'").get() as { id: string };
+    const target = await h.db.get("SELECT id FROM users WHERE username = 'recrue'") as { id: string };
     expect((await cm.post(`/api/backoffice/users/${target.id}/sanction`, { kind: 'warning', reason: 'Rappel des règles' })).status).toBe(200);
     const suspend = await cm.post(`/api/backoffice/users/${target.id}/sanction`, { kind: 'suspend', reason: 'Tentative de suspension' });
     expect(suspend.status).toBe(403);
@@ -409,7 +409,7 @@ describe('§11.2 / §11.3 — Workflow et matrices éditoriales', () => {
     expect(restore.status).toBe(200);
 
     await admin.post(`/api/backoffice/content/${id}/transition`, { to: 'deleted' });
-    h.db.prepare('UPDATE content SET deleted_at = ? WHERE id = ?').run(Date.now() - 31 * 86400000, id);
+    await h.db.run('UPDATE content SET deleted_at = ? WHERE id = ?', [Date.now() - 31 * 86400000, id]);
     const tooLate = await admin.post(`/api/backoffice/content/${id}/transition`, { to: 'draft' });
     expect(tooLate.status).toBe(403);
     expect(tooLate.body.message).toMatch(/30 jours/);
@@ -431,9 +431,9 @@ describe('§11.2 / §11.3 — Workflow et matrices éditoriales', () => {
 describe('§7 / critère — Serveurs communautaires', () => {
   it('refuse les adresses internes et les métadonnées cloud (SSRF)', async () => {
     for (const address of ['127.0.0.1:7777', '10.1.2.3:7777', '169.254.169.254:80', '192.168.1.10:7777', 'localhost:7777', '[::1]:7777']) {
-      const result = await checkTarget(...(address.startsWith('[')
-        ? [address.slice(1, address.indexOf(']')), Number(address.split(']:')[1])]
-        : [address.split(':')[0], Number(address.split(':')[1])]));
+      const host = address.startsWith('[') ? address.slice(1, address.indexOf(']')) : address.split(':')[0];
+      const port = address.startsWith('[') ? Number(address.split(']:')[1]) : Number(address.split(':')[1]);
+      const result = await checkTarget(host, port);
       expect(result.ok).toBe(false);
     }
     expect((await checkTarget('93.184.216.34', 7777)).ok).toBe(true);
@@ -442,7 +442,7 @@ describe('§7 / critère — Serveurs communautaires', () => {
   it('limite à trois serveurs par compte et exige une réauthentification pour modifier', async () => {
     const player = await newClient(h.app);
     await loginPlayer(player);
-    h.db.prepare("DELETE FROM servers WHERE owner_id = (SELECT id FROM users WHERE username = 'joueur')").run();
+    await h.db.run("DELETE FROM servers WHERE owner_id = (SELECT id FROM users WHERE username = 'joueur')");
     for (let i = 0; i < 3; i++) {
       const res = await player.post('/api/servers', {
         name: `Serveur test ${i}`, address: `93.184.216.${20 + i}:7777`, description: 'Test', region: 'EU', maxPlayers: 24,
@@ -459,7 +459,7 @@ describe('§7 / critère — Serveurs communautaires', () => {
     const mine = await player.get('/api/servers/mine');
     expect(mine.body.limits.used).toBe(3);
     const target = mine.body.servers[0].id;
-    h.db.prepare("UPDATE users SET reauth_at = 0 WHERE username = 'joueur'").run();
+    await h.db.run("UPDATE users SET reauth_at = 0 WHERE username = 'joueur'");
     const edit = await player.patch(`/api/servers/${target}`, { name: 'Nouveau nom' });
     expect(edit.status).toBe(403);
     expect(edit.body.error).toBe('reauth_required');
@@ -489,7 +489,7 @@ describe('§5.4 / §5.5 / critère #9 — Licences et tickets de session', () =>
     expect(res.status).toBe(200);
     expect(res.body.decision).toBe('granted');
     expect(res.body.ownership).toBe('owned');
-    const decoded = verifyLicenseToken(h.db, res.body.token);
+    const decoded = await verifyLicenseToken(h.db, res.body.token);
     expect(decoded.valid).toBe(true);
     expect(decoded.claims?.scope).toContain('online');
     expect(decoded.claims?.kid).toBeTruthy();
@@ -521,8 +521,8 @@ describe('§5.4 / §5.5 / critère #9 — Licences et tickets de session', () =>
   });
 
   it('émet un ticket de session à usage unique lié au serveur', async () => {
-    const playerId = (h.db.prepare("SELECT id FROM users WHERE username = 'joueur'").get() as { id: string }).id;
-    const mirageId = (h.db.prepare("SELECT mirage_id FROM users WHERE id = ?").get(playerId) as { mirage_id: string }).mirage_id;
+    const playerId = (await h.db.get("SELECT id FROM users WHERE username = 'joueur'") as { id: string }).id;
+    const mirageId = (await h.db.get("SELECT mirage_id FROM users WHERE id = ?", [playerId]) as { mirage_id: string }).mirage_id;
     const license = await request(h.app).post('/api/v1/licenses/verify').send({
       provider: 'steam', proof: 'demo-proof-owned-123456', mirageId,
     });
@@ -551,7 +551,7 @@ describe('§5.4 / §5.5 / critère #9 — Licences et tickets de session', () =>
   });
 
   it('refuse un ticket présenté à un autre serveur', async () => {
-    const mirageId = (h.db.prepare("SELECT mirage_id FROM users WHERE username = 'joueur'").get() as { mirage_id: string }).mirage_id;
+    const mirageId = (await h.db.get("SELECT mirage_id FROM users WHERE username = 'joueur'") as { mirage_id: string }).mirage_id;
     const license = await request(h.app).post('/api/v1/licenses/verify').send({ provider: 'steam', proof: 'demo-proof-owned-1', mirageId });
     const ticket = await request(h.app).post('/api/v1/session-tickets')
       .set('Authorization', `License ${license.body.token}`).send({ serverId: 'srv-1' });
@@ -581,7 +581,7 @@ describe('§5.7 — Synchronisation des statistiques', () => {
     const payload = {
       serverId: 'srv-1',
       entries: [
-        { mirageId: (h.db.prepare("SELECT mirage_id FROM users WHERE username = 'joueur'").get() as { mirage_id: string }).mirage_id, mode: 'story', operation: 'OP-009', bestTimeMs: 125000, deaths: 3, playtimeMs: 3_600_000, reputation: 42, score: 100, ending: 'FIN-X' },
+        { mirageId: (await h.db.get("SELECT mirage_id FROM users WHERE username = 'joueur'") as { mirage_id: string }).mirage_id, mode: 'story', operation: 'OP-009', bestTimeMs: 125000, deaths: 3, playtimeMs: 3_600_000, reputation: 42, score: 100, ending: 'FIN-X' },
         { mode: 'story', operation: 'OP-010', bestTimeMs: 5, deaths: 0 },
         { mode: 'invalid', operation: 'OP-011' },
       ],
@@ -603,7 +603,7 @@ describe('§5.7 — Synchronisation des statistiques', () => {
     expect(names).not.toContain('recrue'); // private profile
     expect(names).toContain('joueur');
 
-    h.db.prepare("UPDATE stat_entries SET hidden = 1 WHERE user_id = (SELECT id FROM users WHERE username = 'joueur')").run();
+    await h.db.run("UPDATE stat_entries SET hidden = 1 WHERE user_id = (SELECT id FROM users WHERE username = 'joueur')");
     const after = await request(h.app).get('/api/leaderboards?mode=story');
     const afterNames = after.body.bestTimes.flatMap((g: any) => g.entries.map((e: any) => e.displayName));
     expect(afterNames).not.toContain('joueur');
@@ -612,7 +612,7 @@ describe('§5.7 — Synchronisation des statistiques', () => {
 
 describe('§5.6 — Confidentialité du profil', () => {
   it('ne montre que le pseudonyme et le Mirage ID pour un profil privé', async () => {
-    const mirageId = (h.db.prepare("SELECT mirage_id FROM users WHERE username = 'recrue'").get() as { mirage_id: string }).mirage_id;
+    const mirageId = (await h.db.get("SELECT mirage_id FROM users WHERE username = 'recrue'") as { mirage_id: string }).mirage_id;
     const res = await request(h.app).get(`/api/profile/${mirageId}`);
     expect(res.status).toBe(200);
     expect(res.body.profile.restricted).toBe(true);
@@ -621,7 +621,7 @@ describe('§5.6 — Confidentialité du profil', () => {
   });
 
   it('expose les statistiques d’un profil public mais jamais l’adresse électronique', async () => {
-    const mirageId = (h.db.prepare("SELECT mirage_id FROM users WHERE username = 'joueur'").get() as { mirage_id: string }).mirage_id;
+    const mirageId = (await h.db.get("SELECT mirage_id FROM users WHERE username = 'joueur'") as { mirage_id: string }).mirage_id;
     const res = await request(h.app).get(`/api/profile/${mirageId}`);
     expect(res.body.profile.restricted).toBe(false);
     expect(Array.isArray(res.body.stats)).toBe(true);
@@ -638,11 +638,11 @@ describe('§6.12 / critère #11 — Journal d’audit append-only', () => {
       translations: { fr: { title: 'Journal', summary: '', body: '' } },
     });
     expect(created.status).toBe(201);
-    expect(verifyAuditChain(h.db).ok).toBe(true);
+    expect((await verifyAuditChain(h.db)).ok).toBe(true);
 
-    const row = h.db.prepare("SELECT id FROM audit_log WHERE action = 'content.created' ORDER BY id DESC LIMIT 1").get() as { id: number };
-    h.db.prepare("UPDATE audit_log SET action = 'content.created.tampered' WHERE id = ?").run(row.id);
-    const broken = verifyAuditChain(h.db);
+    const row = await h.db.get("SELECT id FROM audit_log WHERE action = 'content.created' ORDER BY id DESC LIMIT 1") as { id: number };
+    await h.db.run("UPDATE audit_log SET action = 'content.created.tampered' WHERE id = ?", [row.id]);
+    const broken = await verifyAuditChain(h.db);
     expect(broken.ok).toBe(false);
     expect(broken.brokenAt).toBe(row.id);
   });
@@ -651,12 +651,12 @@ describe('§6.12 / critère #11 — Journal d’audit append-only', () => {
 describe('§6.11 / critère #10 — Sauvegardes chiffrées et restauration vérifiée', () => {
   it('chiffre la sauvegarde et valide une restauration complète', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zm-backup-'));
-    const backup = createBackup(h.db, dir, 'test');
+    const backup = await createBackup(h.db, dir, 'test');
     const raw = fs.readFileSync(backup.file).toString('latin1');
     expect(raw.includes('CREATE TABLE')).toBe(false);
     expect(raw.slice(0, 5)).toBe('ZMBK1');
 
-    const verification = verifyBackup(backup.file);
+    const verification = await verifyBackup(backup.file);
     expect(verification.ok).toBe(true);
     expect(verification.checks.every((c) => c.ok)).toBe(true);
     expect(verification.tables?.users).toBeGreaterThan(5);
@@ -667,11 +667,11 @@ describe('§6.11 / critère #10 — Sauvegardes chiffrées et restauration véri
 
   it('détecte une sauvegarde corrompue', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'zm-backup-bad-'));
-    const backup = createBackup(h.db, dir, 'corrupt');
+    const backup = await createBackup(h.db, dir, 'corrupt');
     const payload = fs.readFileSync(backup.file);
     payload[payload.length - 10] ^= 0xff;
     fs.writeFileSync(backup.file, payload);
-    const verification = verifyBackup(backup.file);
+    const verification = await verifyBackup(backup.file);
     expect(verification.ok).toBe(false);
     fs.rmSync(dir, { recursive: true, force: true });
   });

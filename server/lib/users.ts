@@ -1,18 +1,18 @@
 import type { DB } from '../db.js';
 import type { PublicUser } from '../types.js';
 
-export function findUserById(db: DB, id: string): PublicUser | undefined {
-  return db.prepare('SELECT * FROM users WHERE id = ?').get(id) as PublicUser | undefined;
+export async function findUserById(db: DB, id: string): Promise<PublicUser | undefined> {
+  return await db.get('SELECT * FROM users WHERE id = ?', [id]) as PublicUser | undefined;
 }
 
-export function findUserByIdentifier(db: DB, identifier: string): PublicUser | undefined {
+export async function findUserByIdentifier(db: DB, identifier: string): Promise<PublicUser | undefined> {
   const value = String(identifier ?? '').trim();
   if (!value) return undefined;
-  const byUsername = db.prepare('SELECT * FROM users WHERE lower(username) = lower(?)').get(value) as PublicUser | undefined;
+  const byUsername = await db.get('SELECT * FROM users WHERE lower(username) = lower(?)', [value]) as PublicUser | undefined;
   if (byUsername) return byUsername;
-  const byEmail = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(value) as PublicUser | undefined;
+  const byEmail = await db.get('SELECT * FROM users WHERE lower(email) = lower(?)', [value]) as PublicUser | undefined;
   if (byEmail) return byEmail;
-  return db.prepare('SELECT * FROM users WHERE mirage_id = ?').get(value) as PublicUser | undefined;
+  return await db.get('SELECT * FROM users WHERE mirage_id = ?', [value]) as PublicUser | undefined;
 }
 
 export interface AccountView {
@@ -54,10 +54,10 @@ export function socialsOf(user: PublicUser): Record<string, string> {
  * by the Private/Public toggle. Email, licences and security data are only
  * ever visible to the owner.
  */
-export function profileView(db: DB, user: PublicUser, viewerId: string | null): AccountView {
+export async function profileView(db: DB, user: PublicUser, viewerId: string | null): Promise<AccountView> {
   const isOwner = viewerId === user.id;
-  const isStaffViewer = !!viewerId && !!findUserById(db, viewerId) &&
-    findUserById(db, viewerId)!.role !== 'player';
+  const viewer = viewerId ? await findUserById(db, viewerId) : undefined;
+  const isStaffViewer = !!viewer && viewer.role !== 'player';
   const isPublic = !!user.profile_public;
 
   const base: AccountView = {
@@ -86,7 +86,7 @@ export function profileView(db: DB, user: PublicUser, viewerId: string | null): 
   if (isOwner) {
     view.isOwner = true;
     view.socials = socialsOf(user);
-    const passkeys = db.prepare('SELECT COUNT(*) AS c FROM webauthn_credentials WHERE user_id = ?').get(user.id) as { c: number };
+    const passkeys = await db.get('SELECT COUNT(*) AS c FROM webauthn_credentials WHERE user_id = ?', [user.id]) as { c: number };
     view.twoFactor = {
       totp: !!user.totp_secret,
       passkeys: passkeys.c,
@@ -113,12 +113,12 @@ export interface StatRow {
   updated_at: number;
 }
 
-export function statsFor(db: DB, userId: string) {
-  return db.prepare('SELECT * FROM stat_entries WHERE user_id = ? AND hidden = 0 ORDER BY mode, operation_code').all(userId) as StatRow[];
+export async function statsFor(db: DB, userId: string) {
+  return await db.all('SELECT * FROM stat_entries WHERE user_id = ? AND hidden = 0 ORDER BY mode, operation_code', [userId]) as StatRow[];
 }
 
-export function statsSummary(db: DB, userId: string) {
-  const rows = statsFor(db, userId);
+export async function statsSummary(db: DB, userId: string) {
+  const rows = await statsFor(db, userId);
   const story = rows.filter((r) => r.mode === 'story');
   const mp = rows.filter((r) => r.mode === 'multiplayer');
   return {

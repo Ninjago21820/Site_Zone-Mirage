@@ -26,7 +26,10 @@ export interface OpenOptions {
 export async function openDb(options: OpenOptions | string = {}): Promise<DB> {
   const file = typeof options === 'string' ? options : options.file;
   const dsn = (process.env.DATABASE_URL ?? '').trim();
-  const useMysql = /^(mysql|mariadb):\/\//i.test(dsn) || Boolean(process.env.MYSQL_HOST);
+  // Un fichier explicitement demandé (tests, vérification de sauvegarde) force
+  // SQLite : la configuration MySQL de l'environnement ne s'applique jamais à
+  // une base de test ou à une restauration vérifiée.
+  const useMysql = !file && (/^(mysql|mariadb):\/\//i.test(dsn) || Boolean(process.env.MYSQL_HOST));
 
   if (useMysql) {
     const db = createMysqlDb(
@@ -71,17 +74,65 @@ export async function migrate(db: DB): Promise<void> {
 }
 
 /** Restaure un instantané logique dans une base vide (vérification de sauvegarde). */
+/**
+ * Réinsère un instantané logique (sauvegarde / restauration).
+ *
+ * L'ordre des tables d'un instantané n'est pas garanti : on insère donc par
+ * passes successives et on reporte les tables dont une clé étrangère n'est pas
+ * encore satisfaite. Une passe sans progrès signifie que l'instantané est
+ * réellement incohérent : l'erreur est alors propagée (la transaction annule
+ * tout, aucune restauration partielle).
+ */
 export async function insertSnapshot(db: DB, snapshot: Record<string, Record<string, unknown>[]>): Promise<number> {
+  const queues = new Map<string, Record<string, unknown>[]>();
+  for (const [table, entries] of Object.entries(snapshot)) {
+    if (entries.length > 0) queues.set(table, [...entries]);
+  }
+
+  const isForeignKeyViolation = (error: unknown): boolean => {
+    const code = (error as { code?: string }).code ?? '';
+    const message = String((error as Error).message ?? '');
+    return (
+      code === 'ER_NO_REFERENCED_ROW_2' ||
+      code === 'ER_ROW_IS_REFERENCED_2' ||
+      code === 'SQLITE_CONSTRAINT_FOREIGNKEY' ||
+      /foreign key/i.test(message)
+    );
+  };
+
   let rows = 0;
   await db.transaction(async () => {
-    for (const [table, entries] of Object.entries(snapshot)) {
-      for (const entry of entries) {
-        const columns = Object.keys(entry);
-        if (columns.length === 0) continue;
-        const sql = `INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`;
-        await db.run(sql, columns.map((column) => entry[column] as never));
-        rows += 1;
+    let remaining = [...queues.keys()];
+    let lastError: unknown;
+    while (remaining.length > 0) {
+      const deferred: string[] = [];
+      let progress = 0;
+      for (const table of remaining) {
+        const queue = queues.get(table)!;
+        while (queue.length > 0) {
+          const entry = queue[0];
+          const columns = Object.keys(entry);
+          if (columns.length === 0) {
+            queue.shift();
+            continue;
+          }
+          const sql = `INSERT INTO ${table} (${columns.join(',')}) VALUES (${columns.map(() => '?').join(',')})`;
+          try {
+            await db.run(sql, columns.map((column) => entry[column] as never));
+          } catch (error) {
+            lastError = error;
+            if (isForeignKeyViolation(error)) break;
+            throw error;
+          }
+          queue.shift();
+          rows += 1;
+          progress += 1;
+        }
+        if (queue.length > 0) deferred.push(table);
       }
+      if (deferred.length === 0) break;
+      if (progress === 0) throw lastError;
+      remaining = deferred;
     }
   });
   return rows;

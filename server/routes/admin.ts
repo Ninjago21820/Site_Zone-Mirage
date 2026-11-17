@@ -20,17 +20,17 @@ const TYPES: ContentType[] = ['wiki', 'news', 'roadmap', 'map', 'faq', 'buyer_ex
 const STATUSES: ContentStatus[] = ['draft', 'review', 'scheduled', 'published', 'archived', 'deleted'];
 const LOCALES = ['fr', 'en', 'es', 'de', 'it'];
 
-function contentWithTranslations(db: DB, id: string) {
-  const row = db.prepare('SELECT * FROM content WHERE id = ?').get(id) as Record<string, any> | undefined;
+async function contentWithTranslations(db: DB, id: string) {
+  const row = await db.get('SELECT * FROM content WHERE id = ?', [id]) as Record<string, any> | undefined;
   if (!row) return null;
-  const translations = db.prepare('SELECT locale,title,summary,body FROM content_translations WHERE content_id = ?').all(id) as {
+  const translations = await db.all('SELECT locale,title,summary,body FROM content_translations WHERE content_id = ?', [id]) as {
     locale: string; title: string; summary: string; body: string;
   }[];
   const author = row.author_id
-    ? (db.prepare('SELECT username FROM users WHERE id = ?').get(row.author_id) as { username: string } | undefined)?.username ?? null
+    ? (await db.get('SELECT username FROM users WHERE id = ?', [row.author_id]) as { username: string } | undefined)?.username ?? null
     : null;
   const verifier = row.verifier_id
-    ? (db.prepare('SELECT username FROM users WHERE id = ?').get(row.verifier_id) as { username: string } | undefined)?.username ?? null
+    ? (await db.get('SELECT username FROM users WHERE id = ?', [row.verifier_id]) as { username: string } | undefined)?.username ?? null
     : null;
   return {
     id: row.id,
@@ -63,11 +63,10 @@ function contentWithTranslations(db: DB, id: string) {
   };
 }
 
-function snapshot(db: DB, contentId: string, actorId: string, note: string) {
-  const data = contentWithTranslations(db, contentId);
+async function snapshot(db: DB, contentId: string, actorId: string, note: string) {
+  const data = await contentWithTranslations(db, contentId);
   if (!data) return;
-  db.prepare('INSERT INTO content_revisions (id,content_id,at,actor_id,snapshot_json,note) VALUES (?,?,?,?,?,?)')
-    .run(newId('rev'), contentId, Date.now(), actorId, JSON.stringify(data), note.slice(0, 200));
+  await db.run('INSERT INTO content_revisions (id,content_id,at,actor_id,snapshot_json,note) VALUES (?,?,?,?,?,?)', [newId('rev'), contentId, Date.now(), actorId, JSON.stringify(data), note.slice(0, 200)]);
 }
 
 function validTranslations(raw: unknown): { locale: string; title: string; summary: string; body: string }[] {
@@ -120,16 +119,16 @@ export function adminRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Dashboard
    * ---------------------------------------------------------------- */
-  router.get('/dashboard', (req, res) => {
-    const byStatus = db.prepare('SELECT status, COUNT(*) AS c FROM content GROUP BY status').all() as { status: string; c: number }[];
-    const byType = db.prepare('SELECT type, COUNT(*) AS c FROM content GROUP BY type').all() as { type: string; c: number }[];
-    const pendingServers = db.prepare("SELECT COUNT(*) AS c FROM servers WHERE status = 'pending' AND deleted_at IS NULL").get() as { c: number };
-    const openTickets = db.prepare("SELECT COUNT(*) AS c FROM support_tickets WHERE status IN ('open','in_progress')").get() as { c: number };
-    const staff = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role <> 'player'").get() as { c: number };
-    const players = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role = 'player'").get() as { c: number };
-    const mk = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role <> 'player' AND totp_secret IS NULL AND webauthn_required = 0").get() as { c: number };
-    const lastAudit = db.prepare('SELECT at, actor_id, action, target_type, target_id FROM audit_log ORDER BY id DESC LIMIT 12').all();
-    const chain = verifyAuditChain(db);
+  router.get('/dashboard', async (req, res) => {
+    const byStatus = await db.all('SELECT status, COUNT(*) AS c FROM content GROUP BY status') as { status: string; c: number }[];
+    const byType = await db.all('SELECT type, COUNT(*) AS c FROM content GROUP BY type') as { type: string; c: number }[];
+    const pendingServers = await db.get("SELECT COUNT(*) AS c FROM servers WHERE status = 'pending' AND deleted_at IS NULL") as { c: number };
+    const openTickets = await db.get("SELECT COUNT(*) AS c FROM support_tickets WHERE status IN ('open','in_progress')") as { c: number };
+    const staff = await db.get("SELECT COUNT(*) AS c FROM users WHERE role <> 'player'") as { c: number };
+    const players = await db.get("SELECT COUNT(*) AS c FROM users WHERE role = 'player'") as { c: number };
+    const mk = await db.get("SELECT COUNT(*) AS c FROM users WHERE role <> 'player' AND totp_secret IS NULL AND webauthn_required = 0") as { c: number };
+    const lastAudit = await db.all('SELECT at, actor_id, action, target_type, target_id FROM audit_log ORDER BY id DESC LIMIT 12');
+    const chain = await verifyAuditChain(db);
     res.json({
       counts: {
         content: byStatus.reduce((a, r) => a + r.c, 0),
@@ -142,8 +141,8 @@ export function adminRoutes(db: DB): Router {
         staffWithoutMfa: mk.c,
       },
       queue: {
-        review: db.prepare("SELECT id, type, slug, updated_at FROM content WHERE status = 'review' ORDER BY updated_at ASC LIMIT 10").all(),
-        scheduled: db.prepare("SELECT id, type, slug, scheduled_at FROM content WHERE status = 'scheduled' ORDER BY scheduled_at ASC LIMIT 10").all(),
+        review: await db.all("SELECT id, type, slug, updated_at FROM content WHERE status = 'review' ORDER BY updated_at ASC LIMIT 10"),
+        scheduled: await db.all("SELECT id, type, slug, scheduled_at FROM content WHERE status = 'scheduled' ORDER BY scheduled_at ASC LIMIT 10"),
       },
       audit: { chainOk: chain.ok, checked: chain.checked, recent: lastAudit },
     });
@@ -152,19 +151,17 @@ export function adminRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Content CRUD + workflow (§11.1, §11.2)
    * ---------------------------------------------------------------- */
-  router.get('/content', (req, res) => {
+  router.get('/content', async (req, res) => {
     const type = req.query.type ? String(req.query.type) : null;
     const status = req.query.status ? String(req.query.status) : null;
-    const rows = db.prepare(
-      `SELECT id FROM content WHERE (? IS NULL OR type = ?) AND (? IS NULL OR status = ?) ORDER BY updated_at DESC LIMIT 300`,
-    ).all(type, type, status, status) as { id: string }[];
+    const rows = await db.all(`SELECT id FROM content WHERE (? IS NULL OR type = ?) AND (? IS NULL OR status = ?) ORDER BY updated_at DESC LIMIT 300`, [type, type, status, status]) as { id: string }[];
     res.json({
-      items: rows.map((r) => contentWithTranslations(db, r.id)).filter(Boolean),
+      items: rows.map(async (r) => await contentWithTranslations(db, r.id)).filter(Boolean),
       canCreate: TYPES.filter((t) => canContent(req.user!.role as Role, t, 'C')),
     });
   });
 
-  router.post('/content', (req, res) => {
+  router.post('/content', async (req, res) => {
     const role = req.user!.role as Role;
     const body = req.body ?? {};
     const type = String(body.type) as ContentType;
@@ -176,7 +173,7 @@ export function adminRoutes(db: DB): Router {
     if (!SLUG_RE.test(slug)) {
       return res.status(400).json({ error: 'invalid_slug', message: 'Identifiant attendu : minuscules, chiffres et tirets.' });
     }
-    const conflict = db.prepare('SELECT 1 AS hit FROM content WHERE type = ? AND slug = ?').get(type, slug);
+    const conflict = await db.get('SELECT 1 AS hit FROM content WHERE type = ? AND slug = ?', [type, slug]);
     if (conflict) return res.status(409).json({ error: 'slug_taken' });
     const translations = validTranslations(body.translations);
     if (!translations.some((t) => t.locale === 'fr' && t.title)) {
@@ -185,37 +182,29 @@ export function adminRoutes(db: DB): Router {
     const blocks = sanitizeBlocks(body.blocks);
     const now = Date.now();
     const id = newId('cnt');
-    db.prepare(`INSERT INTO content
+    await db.run(`INSERT INTO content
       (id,type,status,slug,category,author_id,verifier_id,published_at,scheduled_at,archived_at,deleted_at,spoiler,acs_level,clearance,seo_title,seo_desc,featured,order_index,blocks_json,editor_note,created_at,updated_at)
-      VALUES (?,?, 'draft', ?,?,?,NULL,NULL,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?)`)
-      .run(id, type, slug, String(body.category ?? '').slice(0, 40), req.user!.id,
-        body.spoiler ? 1 : 0, body.acsLevel ? String(body.acsLevel).slice(0, 20) : null,
-        body.clearance ? String(body.clearance).slice(0, 8) : null,
-        stripTags(String(body.seoTitle ?? '')).slice(0, 200), stripTags(String(body.seoDesc ?? '')).slice(0, 300),
-        body.featured ? 1 : 0, Number(body.order ?? 0) || 0, JSON.stringify(blocks),
-        stripTags(String(body.editorNote ?? '')).slice(0, 300), now, now);
-    const insTr = db.prepare('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)');
-    for (const t of translations) insTr.run(id, t.locale, t.title, t.summary, t.body);
+      VALUES (?,?, 'draft', ?,?,?,NULL,NULL,NULL,NULL,NULL,?,?,?,?,?,?,?,?,?,?,?)`, [id, type, slug, String(body.category ?? '').slice(0, 40), req.user!.id, body.spoiler ? 1 : 0, body.acsLevel ? String(body.acsLevel).slice(0, 20) : null, body.clearance ? String(body.clearance).slice(0, 8) : null, stripTags(String(body.seoTitle ?? '')).slice(0, 200), stripTags(String(body.seoDesc ?? '')).slice(0, 300), body.featured ? 1 : 0, Number(body.order ?? 0) || 0, JSON.stringify(blocks), stripTags(String(body.editorNote ?? '')).slice(0, 300), now, now]);
+    for (const t of translations) await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)', [id, t.locale, t.title, t.summary, t.body]);
 
-    snapshot(db, id, req.user!.id, 'created');
-    appendAudit(db, {
+    await snapshot(db, id, req.user!.id, 'created');
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: role, action: 'content.created', targetType: 'content',
       targetId: id, ipTrunc: req.ipTrunc, meta: { type, slug },
     });
-    res.status(201).json({ ok: true, item: contentWithTranslations(db, id) });
+    res.status(201).json({ ok: true, item: await contentWithTranslations(db, id) });
   });
 
-  router.get('/content/:id', (req, res) => {
-    const item = contentWithTranslations(db, String(req.params.id));
+  router.get('/content/:id', async (req, res) => {
+    const item = await contentWithTranslations(db, String(req.params.id));
     if (!item) return res.status(404).json({ error: 'not_found' });
-    const revisions = db.prepare('SELECT id, at, actor_id, note FROM content_revisions WHERE content_id = ? ORDER BY at DESC LIMIT 30')
-      .all(item.id);
+    const revisions = await db.all('SELECT id, at, actor_id, note FROM content_revisions WHERE content_id = ? ORDER BY at DESC LIMIT 30', [item.id]);
     res.json({ item, revisions, permissions: actionsFor(req.user!.role as Role, item.type as ContentType) });
   });
 
-  router.put('/content/:id', (req, res) => {
+  router.put('/content/:id', async (req, res) => {
     const role = req.user!.role as Role;
-    const item = contentWithTranslations(db, String(req.params.id));
+    const item = await contentWithTranslations(db, String(req.params.id));
     if (!item) return res.status(404).json({ error: 'not_found' });
     const type = item.type as ContentType;
     if (!canContent(role, type, 'C')) return res.status(403).json({ error: 'forbidden' });
@@ -241,24 +230,23 @@ export function adminRoutes(db: DB): Router {
       updated_at: Date.now(),
     };
     const fields = Object.keys(updates).map((k) => `${k} = @${k}`).join(', ');
-    db.prepare(`UPDATE content SET ${fields} WHERE id = @id`).run({ ...updates, id: item.id });
+    await db.run(`UPDATE content SET ${fields} WHERE id = @id`, [{ ...updates, id: item.id }]);
 
     if (body.translations) {
       const translations = validTranslations(body.translations);
-      const upsert = db.prepare('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?) ON CONFLICT(content_id,locale) DO UPDATE SET title = excluded.title, summary = excluded.summary, body = excluded.body');
-      for (const t of translations) upsert.run(item.id, t.locale, t.title, t.summary, t.body);
+        for (const t of translations) await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?) ON CONFLICT(content_id,locale) DO UPDATE SET title = excluded.title, summary = excluded.summary, body = excluded.body', [item.id, t.locale, t.title, t.summary, t.body]);
     }
-    snapshot(db, item.id, req.user!.id, 'updated');
-    appendAudit(db, {
+    await snapshot(db, item.id, req.user!.id, 'updated');
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: role, action: 'content.updated', targetType: 'content',
       targetId: item.id, ipTrunc: req.ipTrunc, meta: { type, status: item.status },
     });
-    res.json({ ok: true, item: contentWithTranslations(db, item.id) });
+    res.json({ ok: true, item: await contentWithTranslations(db, item.id) });
   });
 
-  router.post('/content/:id/transition', (req, res) => {
+  router.post('/content/:id/transition', async (req, res) => {
     const role = req.user!.role as Role;
-    const item = contentWithTranslations(db, String(req.params.id));
+    const item = await contentWithTranslations(db, String(req.params.id));
     if (!item) return res.status(404).json({ error: 'not_found' });
     const to = String(req.body?.to) as ContentStatus;
     if (!STATUSES.includes(to)) return res.status(400).json({ error: 'invalid_status' });
@@ -300,10 +288,10 @@ export function adminRoutes(db: DB): Router {
     if (from === 'deleted' && to === 'draft') updates.deleted_at = null;
 
     const fields = Object.keys(updates).map((k) => `${k} = @${k}`).join(', ');
-    db.prepare(`UPDATE content SET ${fields} WHERE id = @id`).run({ ...updates, id: item.id });
-    snapshot(db, item.id, req.user!.id, `transition ${from} → ${to}`);
+    await db.run(`UPDATE content SET ${fields} WHERE id = @id`, [{ ...updates, id: item.id }]);
+    await snapshot(db, item.id, req.user!.id, `transition ${from} → ${to}`);
 
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: role,
       action: check.requiresOverride ? 'content.transition_override' : 'content.transition',
       targetType: 'content', targetId: item.id, ipTrunc: req.ipTrunc,
@@ -311,22 +299,19 @@ export function adminRoutes(db: DB): Router {
     });
 
     if (to === 'review') {
-      const candidates = db.prepare(
-        "SELECT id FROM users WHERE role <> 'player' AND id <> ? ORDER BY role = 'admin' DESC LIMIT 5",
-      ).all(req.user!.id) as { id: string }[];
+      const candidates = await db.all("SELECT id FROM users WHERE role <> 'player' AND id <> ? ORDER BY role = 'admin' DESC LIMIT 5", [req.user!.id]) as { id: string }[];
       for (const candidate of candidates) {
-        if (!canContent((db.prepare('SELECT role FROM users WHERE id = ?').get(candidate.id) as { role: Role }).role, type, 'V')) continue;
-        db.prepare('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)')
-          .run(newId('ntf'), candidate.id, 'content_review', `Contenu à vérifier : ${type}/${item.slug}`, now);
+        if (!canContent((await db.get('SELECT role FROM users WHERE id = ?', [candidate.id]) as { role: Role }).role, type, 'V')) continue;
+        await db.run('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)', [newId('ntf'), candidate.id, 'content_review', `Contenu à vérifier : ${type}/${item.slug}`, now]);
       }
     }
 
-    res.json({ ok: true, item: contentWithTranslations(db, item.id), override: !!check.requiresOverride });
+    res.json({ ok: true, item: await contentWithTranslations(db, item.id), override: !!check.requiresOverride });
   });
 
-  router.post('/content/:id/translate', (req, res) => {
+  router.post('/content/:id/translate', async (req, res) => {
     const role = req.user!.role as Role;
-    const item = contentWithTranslations(db, String(req.params.id));
+    const item = await contentWithTranslations(db, String(req.params.id));
     if (!item) return res.status(404).json({ error: 'not_found' });
     if (!canContent(role, item.type as ContentType, 'T')) {
       return res.status(403).json({ error: 'forbidden', message: 'Droit de traduction requis.' });
@@ -337,35 +322,31 @@ export function adminRoutes(db: DB): Router {
     const summary = stripTags(String(req.body?.summary ?? '')).slice(0, 500);
     const body = String(req.body?.body ?? '').slice(0, 60000);
     if (!title) return res.status(400).json({ error: 'title_required' });
-    db.prepare('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?) ON CONFLICT(content_id,locale) DO UPDATE SET title = excluded.title, summary = excluded.summary, body = excluded.body')
-      .run(item.id, locale, title, summary, body);
-    db.prepare('UPDATE content SET updated_at = ? WHERE id = ?').run(Date.now(), item.id);
-    appendAudit(db, {
+    await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?) ON CONFLICT(content_id,locale) DO UPDATE SET title = excluded.title, summary = excluded.summary, body = excluded.body', [item.id, locale, title, summary, body]);
+    await db.run('UPDATE content SET updated_at = ? WHERE id = ?', [Date.now(), item.id]);
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: role, action: 'content.translated', targetType: 'content',
       targetId: item.id, ipTrunc: req.ipTrunc, meta: { locale },
     });
-    res.json({ ok: true, item: contentWithTranslations(db, item.id) });
+    res.json({ ok: true, item: await contentWithTranslations(db, item.id) });
   });
 
-  router.get('/content/:id/revisions', (req, res) => {
-    const rows = db.prepare('SELECT id, at, actor_id, note, snapshot_json FROM content_revisions WHERE content_id = ? ORDER BY at DESC')
-      .all(String(req.params.id)) as { id: string; at: number; actor_id: string; note: string; snapshot_json: string }[];
+  router.get('/content/:id/revisions', async (req, res) => {
+    const rows = await db.all('SELECT id, at, actor_id, note, snapshot_json FROM content_revisions WHERE content_id = ? ORDER BY at DESC', [String(req.params.id)]) as { id: string; at: number; actor_id: string; note: string; snapshot_json: string }[];
     res.json({ revisions: rows.map((r) => ({ ...r, snapshot: JSON.parse(r.snapshot_json) })) });
   });
 
   /* ---------------------------------------------------------------- *
    * Users, roles, sanctions
    * ---------------------------------------------------------------- */
-  router.get('/users', requireFunction('users_roles'), (req, res) => {
+  router.get('/users', requireFunction('users_roles'), async (req, res) => {
     const search = String(req.query.q ?? '').trim().toLowerCase();
-    const rows = db.prepare(
-      `SELECT id, mirage_id, username, email, role, status, profile_public, created_at,
+    const rows = await db.all(`SELECT id, mirage_id, username, email, role, status, profile_public, created_at,
         (SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = users.id) AS passkeys,
         totp_secret IS NOT NULL AS totp
        FROM users
        WHERE (? = '' OR lower(username) LIKE ? OR lower(email) LIKE ? OR mirage_id LIKE ?)
-       ORDER BY role = 'player', username LIMIT 200`,
-    ).all(search, `%${search}%`, `%${search}%`, `%${search}%`) as Record<string, any>[];
+       ORDER BY role = 'player', username LIMIT 200`, [search, `%${search}%`, `%${search}%`, `%${search}%`]) as Record<string, any>[];
     res.json({
       users: rows.map((r) => ({
         id: r.id, mirageId: r.mirage_id, username: r.username, email: r.email, role: r.role,
@@ -376,8 +357,8 @@ export function adminRoutes(db: DB): Router {
     });
   });
 
-  router.patch('/users/:id', requireFunction('users_roles'), requireReauth, (req, res) => {
-    const target = db.prepare('SELECT * FROM users WHERE id = ?').get(String(req.params.id)) as Record<string, any> | undefined;
+  router.patch('/users/:id', requireFunction('users_roles'), requireReauth, async (req, res) => {
+    const target = await db.get('SELECT * FROM users WHERE id = ?', [String(req.params.id)]) as Record<string, any> | undefined;
     if (!target) return res.status(404).json({ error: 'not_found' });
     const role = String(req.body?.role ?? '') as Role;
     if (!(role in ROLE_LABELS)) return res.status(400).json({ error: 'invalid_role' });
@@ -385,25 +366,25 @@ export function adminRoutes(db: DB): Router {
       return res.status(409).json({ error: 'self_demotion', message: 'Vous ne pouvez pas retirer votre propre rôle administrateur.' });
     }
     if (ROLE_LABELS[role] === 'Joueur' && target.role !== 'player') {
-      const admins = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role = 'admin'").get() as { c: number };
+      const admins = await db.get("SELECT COUNT(*) AS c FROM users WHERE role = 'admin'") as { c: number };
       if (target.role === 'admin' && admins.c <= 1) {
         return res.status(409).json({ error: 'last_admin', message: 'Le dernier administrateur ne peut pas être rétrogradé.' });
       }
     }
-    db.prepare('UPDATE users SET role = ?, updated_at = ? WHERE id = ?').run(role, Date.now(), target.id);
+    await db.run('UPDATE users SET role = ?, updated_at = ? WHERE id = ?', [role, Date.now(), target.id]);
     if (role !== 'player') {
-      db.prepare('UPDATE users SET webauthn_required = ? WHERE id = ?').run(role === 'admin' ? 1 : 0, target.id);
-      revokeAllForUser(db, target.id, null, 'role_changed');
+      await db.run('UPDATE users SET webauthn_required = ? WHERE id = ?', [role === 'admin' ? 1 : 0, target.id]);
+      await revokeAllForUser(db, target.id, null, 'role_changed');
     }
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'user.role_changed', targetType: 'user',
       targetId: target.id, ipTrunc: req.ipTrunc, meta: { from: target.role, to: role, target: target.username },
     });
     res.json({ ok: true });
   });
 
-  router.post('/users/:id/sanction', requireFunction('account_sanctions'), (req, res) => {
-    const target = db.prepare('SELECT * FROM users WHERE id = ?').get(String(req.params.id)) as Record<string, any> | undefined;
+  router.post('/users/:id/sanction', requireFunction('account_sanctions'), async (req, res) => {
+    const target = await db.get('SELECT * FROM users WHERE id = ?', [String(req.params.id)]) as Record<string, any> | undefined;
     if (!target) return res.status(404).json({ error: 'not_found' });
     const kind = String(req.body?.kind ?? '');
     const reason = stripTags(String(req.body?.reason ?? '')).slice(0, 500);
@@ -411,8 +392,7 @@ export function adminRoutes(db: DB): Router {
     const role = req.user!.role as Role;
 
     if (kind === 'warning') {
-      db.prepare('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)')
-        .run(newId('ntf'), target.id, 'sanction', `Avertissement : ${reason}`, Date.now());
+      await db.run('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)', [newId('ntf'), target.id, 'sanction', `Avertissement : ${reason}`, Date.now()]);
     } else if (kind === 'suspend' || kind === 'ban') {
       // The Community Manager may only issue warnings (§11.4).
       if (role === 'community_manager') {
@@ -420,13 +400,12 @@ export function adminRoutes(db: DB): Router {
       }
       if (role !== 'admin' && role !== 'moderator') return res.status(403).json({ error: 'forbidden' });
       if (target.role === 'admin') return res.status(403).json({ error: 'forbidden', message: 'Un administrateur ne peut pas être sanctionné ici.' });
-      db.prepare('UPDATE users SET status = ?, updated_at = ? WHERE id = ?')
-        .run(kind === 'ban' ? 'banned' : 'suspended', Date.now(), target.id);
-      revokeAllForUser(db, target.id, null, 'sanction');
+      await db.run('UPDATE users SET status = ?, updated_at = ? WHERE id = ?', [kind === 'ban' ? 'banned' : 'suspended', Date.now(), target.id]);
+      await revokeAllForUser(db, target.id, null, 'sanction');
     } else {
       return res.status(400).json({ error: 'invalid_kind' });
     }
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: role, action: `user.sanction_${kind}`, targetType: 'user',
       targetId: target.id, ipTrunc: req.ipTrunc, meta: { reason },
     });
@@ -434,19 +413,19 @@ export function adminRoutes(db: DB): Router {
   });
 
   /** Staff 2FA reset: admin only, reasoned, fully audited (§6.4). */
-  router.post('/users/:id/mfa-reset', requireFunction('users_roles'), requireReauth, (req, res) => {
-    const target = db.prepare('SELECT * FROM users WHERE id = ?').get(String(req.params.id)) as Record<string, any> | undefined;
+  router.post('/users/:id/mfa-reset', requireFunction('users_roles'), requireReauth, async (req, res) => {
+    const target = await db.get('SELECT * FROM users WHERE id = ?', [String(req.params.id)]) as Record<string, any> | undefined;
     if (!target) return res.status(404).json({ error: 'not_found' });
     if (target.role === 'admin' && target.id !== req.user!.id) {
-      const admins = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND id <> ?").get(target.id) as { c: number };
+      const admins = await db.get("SELECT COUNT(*) AS c FROM users WHERE role = 'admin' AND id <> ?", [target.id]) as { c: number };
       if (admins.c < 1) return res.status(409).json({ error: 'last_admin', message: 'Un autre administrateur doit valider cette réinitialisation.' });
     }
     const reason = stripTags(String(req.body?.reason ?? '')).slice(0, 300);
     if (reason.length < 10) return res.status(400).json({ error: 'reason_required', message: 'Motif d’au moins 10 caractères requis.' });
-    db.prepare('UPDATE users SET totp_secret = NULL, totp_last_step = NULL WHERE id = ?').run(target.id);
-    db.prepare('DELETE FROM backup_codes WHERE user_id = ?').run(target.id);
-    revokeAllForUser(db, target.id, null, 'mfa_reset_by_admin');
-    appendAudit(db, {
+    await db.run('UPDATE users SET totp_secret = NULL, totp_last_step = NULL WHERE id = ?', [target.id]);
+    await db.run('DELETE FROM backup_codes WHERE user_id = ?', [target.id]);
+    await revokeAllForUser(db, target.id, null, 'mfa_reset_by_admin');
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'mfa.admin_reset', targetType: 'user',
       targetId: target.id, ipTrunc: req.ipTrunc, meta: { reason, target: target.username },
     });
@@ -459,32 +438,30 @@ export function adminRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Audit log (§6.12)
    * ---------------------------------------------------------------- */
-  router.get('/audit', requireFunction('audit_log'), (req, res) => {
+  router.get('/audit', requireFunction('audit_log'), async (req, res) => {
     const limit = Math.min(500, Math.max(1, Number(req.query.limit ?? 100)));
     const action = req.query.action ? String(req.query.action) : null;
-    const rows = db.prepare(
-      `SELECT * FROM audit_log WHERE (? IS NULL OR action LIKE ?) ORDER BY id DESC LIMIT ?`,
-    ).all(action, action ? `%${action}%` : null, limit) as Record<string, any>[];
+    const rows = await db.all(`SELECT * FROM audit_log WHERE (? IS NULL OR action LIKE ?) ORDER BY id DESC LIMIT ?`, [action, action ? `%${action}%` : null, limit]) as Record<string, any>[];
     res.json({
       entries: rows.map((r) => ({
         id: r.id, at: r.at, actorId: r.actor_id, actorRole: r.actor_role, action: r.action,
         targetType: r.target_type, targetId: r.target_id, ip: r.ip_trunc,
         meta: JSON.parse(r.meta_json || '{}'), hash: r.hash, prevHash: r.prev_hash,
       })),
-      chain: verifyAuditChain(db),
+      chain: await verifyAuditChain(db),
       retention: { months: 12, ipTruncatedAfterDays: 30 },
     });
   });
 
-  router.post('/audit/verify', requireFunction('audit_log'), (_req, res) => {
-    res.json(verifyAuditChain(db));
+  router.post('/audit/verify', requireFunction('audit_log'), async (_req, res) => {
+    res.json(await verifyAuditChain(db));
   });
 
   /* ---------------------------------------------------------------- *
    * Servers moderation queue is served by /api/servers/queue
    * ---------------------------------------------------------------- */
-  router.get('/servers', requireFunction('server_validation'), (_req, res) => {
-    const rows = db.prepare('SELECT * FROM servers WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200').all() as Record<string, any>[];
+  router.get('/servers', requireFunction('server_validation'), async (_req, res) => {
+    const rows = await db.all('SELECT * FROM servers WHERE deleted_at IS NULL ORDER BY created_at DESC LIMIT 200') as Record<string, any>[];
     res.json({
       servers: rows.map((r) => ({
         id: r.id, name: r.name, address: `${r.host}:${r.port}`, status: r.status,
@@ -497,10 +474,10 @@ export function adminRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * API keys / signing keys (§5.4)
    * ---------------------------------------------------------------- */
-  router.get('/api-keys', requireFunction('api_keys'), (_req, res) => {
-    ensureSigningKey(db);
+  router.get('/api-keys', requireFunction('api_keys'), async (_req, res) => {
+    await ensureSigningKey(db);
     res.json({
-      keys: publicSigningKeys(db),
+      keys: await publicSigningKeys(db),
       endpoints: [
         'POST /api/v1/licenses/verify',
         'POST /api/v1/session-tickets',
@@ -512,12 +489,12 @@ export function adminRoutes(db: DB): Router {
     });
   });
 
-  router.post('/api-keys/rotate', requireFunction('api_keys'), requireReauth, (req, res) => {
+  router.post('/api-keys/rotate', requireFunction('api_keys'), requireReauth, async (req, res) => {
     const reason = stripTags(String(req.body?.reason ?? '')).slice(0, 300);
     if (reason.length < 10) return res.status(400).json({ error: 'reason_required' });
-    db.prepare('UPDATE api_keys SET revoked_at = ? WHERE revoked_at IS NULL').run(Date.now());
-    const key = ensureSigningKey(db);
-    appendAudit(db, {
+    await db.run('UPDATE api_keys SET revoked_at = ? WHERE revoked_at IS NULL', [Date.now()]);
+    const key = await ensureSigningKey(db);
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'api_keys.rotated',
       targetType: 'api_key', targetId: key.kid, ipTrunc: req.ipTrunc, meta: { reason },
     });
@@ -527,23 +504,22 @@ export function adminRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Backups (§6.11) — run + verify
    * ---------------------------------------------------------------- */
-  router.get('/backups', requireFunction('backups_logs'), (_req, res) => {
+  router.get('/backups', requireFunction('backups_logs'), async (_req, res) => {
     res.json({
-      runs: db.prepare('SELECT * FROM backup_runs ORDER BY at DESC LIMIT 40').all(),
+      runs: await db.all('SELECT * FROM backup_runs ORDER BY at DESC LIMIT 40'),
       files: listBackups().map((b) => ({ file: b.file, sizeBytes: b.sizeBytes, createdAt: b.createdAt })),
       encryption: 'AES-256-GCM',
       restoreVerificationRequired: true,
     });
   });
 
-  router.post('/backups/run', requireFunction('backups_logs'), (req, res) => {
+  router.post('/backups/run', requireFunction('backups_logs'), async (req, res) => {
     if (!rateLimit(`backup:${req.user!.id}`, 5, 10 * 60 * 1000)) return res.status(429).json({ error: 'rate_limited' });
     try {
-      const result = createBackup(db, undefined, 'manual');
-      const verification = verifyBackup(result.file);
-      db.prepare('UPDATE backup_runs SET status = ?, verified_at = ? WHERE id = ?')
-        .run(verification.ok ? 'verified' : 'verification_failed', verification.ok ? Date.now() : null, result.id);
-      appendAudit(db, {
+      const result = await createBackup(db, undefined, 'manual');
+      const verification = await verifyBackup(result.file);
+      await db.run('UPDATE backup_runs SET status = ?, verified_at = ? WHERE id = ?', [verification.ok ? 'verified' : 'verification_failed', verification.ok ? Date.now() : null, result.id]);
+      await appendAudit(db, {
         actorId: req.user!.id, actorRole: req.user!.role, action: 'backup.created', targetType: 'backup',
         targetId: result.id, ipTrunc: req.ipTrunc, meta: { verified: verification.ok, sizeBytes: result.sizeBytes },
       });
@@ -557,13 +533,13 @@ export function adminRoutes(db: DB): Router {
     }
   });
 
-  router.post('/backups/verify', requireFunction('backups_logs'), (req, res) => {
+  router.post('/backups/verify', requireFunction('backups_logs'), async (req, res) => {
     const files = listBackups();
     const target = String(req.body?.file ?? '');
-    const file = target ? files.find((f) => f.file === target)?.path : files[0]?.path;
+    const file = target ? files.find((f) => f.file === target)?.file : files[0]?.file;
     if (!file) return res.status(404).json({ error: 'no_backup' });
-    const verification = verifyBackup(file);
-    appendAudit(db, {
+    const verification = await verifyBackup(file);
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'backup.verified', targetType: 'backup',
       targetId: file.split('/').pop(), ipTrunc: req.ipTrunc, meta: { ok: verification.ok },
     });
@@ -573,10 +549,8 @@ export function adminRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Scores / leaderboard moderation
    * ---------------------------------------------------------------- */
-  router.get('/scores', requireFunction('score_removal'), (_req, res) => {
-    const rows = db.prepare(
-      `SELECT s.*, u.username FROM stat_entries s LEFT JOIN users u ON u.id = s.user_id ORDER BY s.updated_at DESC LIMIT 300`,
-    ).all() as Record<string, any>[];
+  router.get('/scores', requireFunction('score_removal'), async (_req, res) => {
+    const rows = await db.all(`SELECT s.*, u.username FROM stat_entries s LEFT JOIN users u ON u.id = s.user_id ORDER BY s.updated_at DESC LIMIT 300`) as Record<string, any>[];
     res.json({
       scores: rows.map((r) => ({
         id: r.id, player: r.username ?? r.display_name, mode: r.mode, operation: r.operation_code,
@@ -586,13 +560,13 @@ export function adminRoutes(db: DB): Router {
     });
   });
 
-  router.post('/scores/:id/remove', requireFunction('score_removal'), (req, res) => {
-    const row = db.prepare('SELECT * FROM stat_entries WHERE id = ?').get(String(req.params.id)) as Record<string, any> | undefined;
+  router.post('/scores/:id/remove', requireFunction('score_removal'), async (req, res) => {
+    const row = await db.get('SELECT * FROM stat_entries WHERE id = ?', [String(req.params.id)]) as Record<string, any> | undefined;
     if (!row) return res.status(404).json({ error: 'not_found' });
     const reason = stripTags(String(req.body?.reason ?? '')).slice(0, 300);
     if (reason.length < 5) return res.status(400).json({ error: 'reason_required' });
-    db.prepare('UPDATE stat_entries SET hidden = 1, updated_at = ? WHERE id = ?').run(Date.now(), row.id);
-    appendAudit(db, {
+    await db.run('UPDATE stat_entries SET hidden = 1, updated_at = ? WHERE id = ?', [Date.now(), row.id]);
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'score.removed', targetType: 'stat_entry',
       targetId: row.id, ipTrunc: req.ipTrunc, meta: { reason, operation: row.operation_code, player: row.user_id },
     });
@@ -602,22 +576,22 @@ export function adminRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * i18n progress (translator)
    * ---------------------------------------------------------------- */
-  router.get('/i18n', (_req, res) => {
-    const progress = JSON.parse((db.prepare("SELECT value FROM settings WHERE key = 'i18n.progress'").get() as { value: string } | undefined)?.value ?? '{}');
-    const counts = db.prepare('SELECT locale, COUNT(*) AS c FROM content_translations WHERE title <> \'\' GROUP BY locale').all() as { locale: string; c: number }[];
+  router.get('/i18n', async (_req, res) => {
+    const progress = JSON.parse((await db.get("SELECT value FROM settings WHERE key = 'i18n.progress'") as { value: string } | undefined)?.value ?? '{}');
+    const counts = await db.all('SELECT locale, COUNT(*) AS c FROM content_translations WHERE title <> \'\' GROUP BY locale') as { locale: string; c: number }[];
     res.json({ progress, counts, locales: LOCALES, threshold: 0.85 });
   });
 
-  router.post('/i18n', (req, res) => {
+  router.post('/i18n', async (req, res) => {
     const role = req.user!.role as Role;
     if (role !== 'translator' && role !== 'admin') return res.status(403).json({ error: 'forbidden' });
     const locale = String(req.body?.locale ?? '');
     const value = Number(req.body?.progress);
     if (!LOCALES.includes(locale) || !(value >= 0 && value <= 1)) return res.status(400).json({ error: 'invalid_payload' });
-    const current = JSON.parse((db.prepare("SELECT value FROM settings WHERE key = 'i18n.progress'").get() as { value: string } | undefined)?.value ?? '{}');
+    const current = JSON.parse((await db.get("SELECT value FROM settings WHERE key = 'i18n.progress'") as { value: string } | undefined)?.value ?? '{}');
     current[locale] = value;
-    db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES ('i18n.progress', ?)").run(JSON.stringify(current));
-    appendAudit(db, {
+    await db.run("INSERT OR REPLACE INTO settings (key,value) VALUES ('i18n.progress', ?)", [JSON.stringify(current)]);
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: role, action: 'i18n.progress_updated', targetType: 'setting',
       targetId: locale, ipTrunc: req.ipTrunc, meta: { value },
     });
@@ -627,15 +601,13 @@ export function adminRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Security posture / acceptance criteria (§6.14)
    * ---------------------------------------------------------------- */
-  router.get('/criteria', (_req, res) => {
-    const staffWithoutMfa = db.prepare("SELECT COUNT(*) AS c FROM users WHERE role <> 'player' AND totp_secret IS NULL").get() as { c: number };
-    const adminWithoutPasskey = db.prepare(
-      `SELECT COUNT(*) AS c FROM users u WHERE u.role = 'admin'
-       AND (SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = u.id) = 0`,
-    ).get() as { c: number };
-    const plainPasswords = db.prepare("SELECT COUNT(*) AS c FROM users WHERE password_hash IS NOT NULL AND password_hash NOT LIKE '$argon2id$%'").get() as { c: number };
-    const chain = verifyAuditChain(db);
-    const latestBackup = db.prepare("SELECT * FROM backup_runs WHERE status = 'verified' ORDER BY at DESC LIMIT 1").get() as Record<string, any> | undefined;
+  router.get('/criteria', async (_req, res) => {
+    const staffWithoutMfa = await db.get("SELECT COUNT(*) AS c FROM users WHERE role <> 'player' AND totp_secret IS NULL") as { c: number };
+    const adminWithoutPasskey = await db.get(`SELECT COUNT(*) AS c FROM users u WHERE u.role = 'admin'
+       AND (SELECT COUNT(*) FROM webauthn_credentials w WHERE w.user_id = u.id) = 0`) as { c: number };
+    const plainPasswords = await db.get("SELECT COUNT(*) AS c FROM users WHERE password_hash IS NOT NULL AND password_hash NOT LIKE '$argon2id$%'") as { c: number };
+    const chain = await verifyAuditChain(db);
+    const latestBackup = await db.get("SELECT * FROM backup_runs WHERE status = 'verified' ORDER BY at DESC LIMIT 1") as Record<string, any> | undefined;
 
     res.json({
       generatedAt: Date.now(),
@@ -655,7 +627,7 @@ export function adminRoutes(db: DB): Router {
     });
   });
 
-  router.get('/store', requireFunction('store_pages'), (_req, res) => {
+  router.get('/store', requireFunction('store_pages'), async (_req, res) => {
     res.json({
       editions: [
         { id: 'standard', price: 25, priceLabel: '25,00 € TTC', defined: true },
@@ -666,7 +638,7 @@ export function adminRoutes(db: DB): Router {
         { id: 'steam', available: true, note: 'Boutons d’achat et de liste de souhaits' },
         { id: 'epic', available: false, note: 'Masqué jusqu’à la mise en ligne de la page Epic' },
       ],
-      buyerExtras: db.prepare("SELECT slug, updated_at FROM content WHERE type = 'buyer_extras'").all(),
+      buyerExtras: await db.all("SELECT slug, updated_at FROM content WHERE type = 'buyer_extras'"),
       paymentDisabled: true,
       launcherDisabled: true,
     });

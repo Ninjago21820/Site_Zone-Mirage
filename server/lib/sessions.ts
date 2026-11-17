@@ -50,23 +50,19 @@ export function contextHash(ip: string, ua: string): string {
   return sha256(`${truncateIp(ip)}|${ua}`).slice(0, 32);
 }
 
-export function createSession(
+export async function createSession(
   db: DB,
   params: { userId: string; role: string; ip: string; userAgent: string; mfaVerified: boolean },
-): { token: string; session: SessionRow } {
+): Promise<{ token: string; session: SessionRow }> {
   const token = newToken(32);
   const id = sha256(token);
   const policy = policyFor(params.role);
   const now = Date.now();
   const csrf = newToken(24);
-  db.prepare(`INSERT INTO sessions
+  await db.run(`INSERT INTO sessions
     (id,user_id,csrf_token,created_at,last_seen,expires_at,absolute_expires_at,ip_trunc,ip_hash,user_agent,device_label,mfa_verified,revoked_at,revoked_reason)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)`).run(
-    id, params.userId, csrf, now, now, now + policy.idleMs, now + policy.absoluteMs,
-    truncateIp(params.ip), sha256(params.ip || 'unknown'), params.userAgent ?? '',
-    deviceLabel(params.userAgent ?? ''), params.mfaVerified ? 1 : 0,
-  );
-  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow;
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,NULL,NULL)`, [id, params.userId, csrf, now, now, now + policy.idleMs, now + policy.absoluteMs, truncateIp(params.ip), sha256(params.ip || 'unknown'), params.userAgent ?? '', deviceLabel(params.userAgent ?? ''), params.mfaVerified ? 1 : 0]);
+  const session = await db.get('SELECT * FROM sessions WHERE id = ?', [id]) as SessionRow;
   return { token, session };
 }
 
@@ -77,10 +73,10 @@ export interface LoadedSession {
   contextChanged: boolean;
 }
 
-export function loadSession(db: DB, token: string | undefined, ip: string, ua: string): LoadedSession | null {
+export async function loadSession(db: DB, token: string | undefined, ip: string, ua: string): Promise<LoadedSession | null> {
   if (!token) return null;
   const id = sha256(token);
-  const session = db.prepare('SELECT * FROM sessions WHERE id = ?').get(id) as SessionRow | undefined;
+  const session = await db.get('SELECT * FROM sessions WHERE id = ?', [id]) as SessionRow | undefined;
   if (!session) return null;
   if (session.revoked_at) return { session, token, expired: true, contextChanged: false };
   const now = Date.now();
@@ -92,48 +88,42 @@ export function loadSession(db: DB, token: string | undefined, ip: string, ua: s
 }
 
 /** Sliding idle expiry, capped by the absolute lifetime. */
-export function touchSession(db: DB, session: SessionRow, role: string) {
+export async function touchSession(db: DB, session: SessionRow, role: string) {
   const now = Date.now();
   if (now - session.last_seen < 60_000) return;
   const policy = policyFor(role);
   const expiresAt = Math.min(now + policy.idleMs, session.absolute_expires_at);
-  db.prepare('UPDATE sessions SET last_seen = ?, expires_at = ? WHERE id = ?').run(now, expiresAt, session.id);
+  await db.run('UPDATE sessions SET last_seen = ?, expires_at = ? WHERE id = ?', [now, expiresAt, session.id]);
 }
 
-export function markMfaVerified(db: DB, sessionId: string) {
-  db.prepare('UPDATE sessions SET mfa_verified = 1 WHERE id = ?').run(sessionId);
+export async function markMfaVerified(db: DB, sessionId: string) {
+  await db.run('UPDATE sessions SET mfa_verified = 1 WHERE id = ?', [sessionId]);
 }
 
-export function rotateSession(db: DB, session: SessionRow, role: string, ip: string, ua: string, mfa: boolean) {
-  db.prepare('UPDATE sessions SET revoked_at = ?, revoked_reason = ? WHERE id = ?')
-    .run(Date.now(), 'rotated', session.id);
+export async function rotateSession(db: DB, session: SessionRow, role: string, ip: string, ua: string, mfa: boolean) {
+  await db.run('UPDATE sessions SET revoked_at = ?, revoked_reason = ? WHERE id = ?', [Date.now(), 'rotated', session.id]);
   const userId = session.user_id;
-  return createSession(db, { userId, role, ip, userAgent: ua, mfaVerified: mfa });
+  return await createSession(db, { userId, role, ip, userAgent: ua, mfaVerified: mfa });
 }
 
-export function revokeSession(db: DB, sessionId: string, reason = 'user') {
-  db.prepare('UPDATE sessions SET revoked_at = ?, revoked_reason = ? WHERE id = ? AND revoked_at IS NULL')
-    .run(Date.now(), reason, sessionId);
+export async function revokeSession(db: DB, sessionId: string, reason = 'user') {
+  await db.run('UPDATE sessions SET revoked_at = ?, revoked_reason = ? WHERE id = ? AND revoked_at IS NULL', [Date.now(), reason, sessionId]);
 }
 
 /** §6.8 criterion #6 — revoke every other session after a password / 2FA change. */
-export function revokeAllForUser(db: DB, userId: string, exceptSessionId: string | null, reason: string): number {
-  const info = db.prepare(
-    `UPDATE sessions SET revoked_at = ?, revoked_reason = ?
-     WHERE user_id = ? AND revoked_at IS NULL AND id IS NOT ?`,
-  ).run(Date.now(), reason, userId, exceptSessionId);
+export async function revokeAllForUser(db: DB, userId: string, exceptSessionId: string | null, reason: string): Promise<number> {
+  const info = await db.run(`UPDATE sessions SET revoked_at = ?, revoked_reason = ?
+     WHERE user_id = ? AND revoked_at IS NULL AND id IS NOT ?`, [Date.now(), reason, userId, exceptSessionId]);
   return info.changes;
 }
 
-export function listSessions(db: DB, userId: string) {
-  return db.prepare(
-    `SELECT id, created_at, last_seen, expires_at, absolute_expires_at, ip_trunc, device_label, user_agent, mfa_verified, revoked_at
-     FROM sessions WHERE user_id = ? ORDER BY last_seen DESC LIMIT 50`,
-  ).all(userId);
+export async function listSessions(db: DB, userId: string) {
+  return await db.all(`SELECT id, created_at, last_seen, expires_at, absolute_expires_at, ip_trunc, device_label, user_agent, mfa_verified, revoked_at
+     FROM sessions WHERE user_id = ? ORDER BY last_seen DESC LIMIT 50`, [userId]);
 }
 
-export function setReauth(db: DB, userId: string) {
-  db.prepare('UPDATE users SET reauth_at = ? WHERE id = ?').run(Date.now(), userId);
+export async function setReauth(db: DB, userId: string) {
+  await db.run('UPDATE users SET reauth_at = ? WHERE id = ?', [Date.now(), userId]);
 }
 
 export function describeSession(session: SessionRow) {

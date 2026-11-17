@@ -1,12 +1,13 @@
 import request from 'supertest';
 import type { Express } from 'express';
-import { openDb, seed, type DB, DEMO_TOTP_SECRET } from '../server/db.js';
+import { openDb, type DB } from '../server/db.js';
+import { seedFixtures, FIXTURE_TOTP_SECRET } from './fixtures/seed.js';
 import { createApp } from '../server/index.js';
 import { totpAt } from '../server/lib/totp.js';
 
 export const STAFF_PASSWORD = 'Mirage-Staff-2026';
 export const PLAYER_PASSWORD = 'Mirage-Demo-2026';
-export { DEMO_TOTP_SECRET };
+export { FIXTURE_TOTP_SECRET };
 
 export interface Harness {
   db: DB;
@@ -14,8 +15,8 @@ export interface Harness {
 }
 
 export async function harness(): Promise<Harness> {
-  const db = openDb(':memory:');
-  await seed(db);
+  const db = await openDb(':memory:');
+  await seedFixtures(db);
   const app = await createApp(db, { frontend: 'none' });
   return { db, app };
 }
@@ -48,7 +49,7 @@ export async function newClient(app: Express): Promise<Client> {
   const state = { csrf: extractCookie(boot, 'zm_csrf') ?? '' };
   const withCsrf = (req: request.Test) => req.set('X-CSRF-Token', state.csrf);
   const send = async (req: request.Test): Promise<request.Response> => {
-    const res = await req;
+    const res: request.Response = await req;
     const fresh = extractCookie(res, 'zm_csrf');
     if (fresh) state.csrf = fresh;
     return res;
@@ -63,25 +64,25 @@ export async function newClient(app: Express): Promise<Client> {
       if (fresh) state.csrf = fresh;
     },
     get: (path) => agent.get(path),
-    post: (path, body) => send(withCsrf(agent.post(path)).send(body ?? {})),
-    patch: (path, body) => send(withCsrf(agent.patch(path)).send(body ?? {})),
-    put: (path, body) => send(withCsrf(agent.put(path)).send(body ?? {})),
-    del: (path, body) => send(withCsrf(agent.delete(path)).send(body ?? {})),
+    post: (path, body) => send(withCsrf(agent.post(path)).send((body ?? {}) as object)),
+    patch: (path, body) => send(withCsrf(agent.patch(path)).send((body ?? {}) as object)),
+    put: (path, body) => send(withCsrf(agent.put(path)).send((body ?? {}) as object)),
+    del: (path, body) => send(withCsrf(agent.delete(path)).send((body ?? {}) as object)),
   };
   return client;
 }
 
 /** Clears the TOTP anti-replay marker so a test can log in again immediately. */
-export function resetTotp(db: DB, username: string) {
-  db.prepare('UPDATE users SET totp_last_step = NULL WHERE username = ?').run(username);
+export async function resetTotp(db: DB, username: string) {
+  await db.run('UPDATE users SET totp_last_step = NULL WHERE username = ?', [username]);
 }
 
 export async function loginStaff(client: Client, db: DB, username: string): Promise<request.Response> {
-  resetTotp(db, username);
+  await resetTotp(db, username);
   const first = await client.post('/api/auth/login', { identifier: username, password: STAFF_PASSWORD });
   client.sync(first);
   if (first.body?.mfaRequired) {
-    const secret = (db.prepare('SELECT totp_secret FROM users WHERE username = ?').get(username) as { totp_secret: string }).totp_secret;
+    const secret = (await db.get('SELECT totp_secret FROM users WHERE username = ?', [username]) as { totp_secret: string }).totp_secret;
     const second = await client.post('/api/auth/login/2fa', { code: totpAt(secret) });
     client.sync(second);
     return second;

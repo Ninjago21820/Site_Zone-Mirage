@@ -32,23 +32,19 @@ export function isValidMirageId(id: string): boolean {
  * Generate a guaranteed-unused Mirage ID and reserve it permanently.
  * Reserved IDs are never handed out again, even if the account is deleted.
  */
-export function mirageIdFor(db: DB, createdAtMs = Date.now()): string {
-  const check = db.prepare('SELECT 1 AS hit FROM reserved_mirage_ids WHERE mirage_id = ?');
-  const userCheck = db.prepare('SELECT 1 AS hit FROM users WHERE mirage_id = ?');
+export async function mirageIdFor(db: DB, createdAtMs = Date.now()): Promise<string> {
   for (let attempt = 0; attempt < 64; attempt++) {
     const candidate = buildMirageId(createdAtMs, randomDigits(18));
-    if (check.get(candidate) || userCheck.get(candidate)) continue;
-    db.prepare('INSERT INTO reserved_mirage_ids (mirage_id, reason, created_at) VALUES (?,?,?)')
-      .run(candidate, 'issued', Date.now());
+    if (await db.get('SELECT 1 AS hit FROM reserved_mirage_ids WHERE mirage_id = ?', [candidate]) || await db.get('SELECT 1 AS hit FROM users WHERE mirage_id = ?', [candidate])) continue;
+    await db.run('INSERT INTO reserved_mirage_ids (mirage_id, reason, created_at) VALUES (?,?,?)', [candidate, 'issued', Date.now()]);
     return candidate;
   }
   throw new Error('MIRAGE_ID_EXHAUSTED');
 }
 
-export function reserveMirageId(db: DB, id: string, reason: string) {
+export async function reserveMirageId(db: DB, id: string, reason: string) {
   if (!isValidMirageId(id)) throw new Error('INVALID_MIRAGE_ID');
-  db.prepare('INSERT OR IGNORE INTO reserved_mirage_ids (mirage_id, reason, created_at) VALUES (?,?,?)')
-    .run(id, reason, Date.now());
+  await db.run('INSERT OR IGNORE INTO reserved_mirage_ids (mirage_id, reason, created_at) VALUES (?,?,?)', [id, reason, Date.now()]);
 }
 
 export const newId = (prefix: string) => `${prefix}_${randomBytes(16).toString('base64url')}`;

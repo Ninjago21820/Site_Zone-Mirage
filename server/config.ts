@@ -33,8 +33,12 @@ export const EXPECTED_ORIGIN = process.env.PUBLIC_ORIGIN ?? '';
 export const DATA_DIR = process.env.DATA_DIR ?? path.join(process.cwd(), 'data');
 export const BACKUP_DIR = process.env.BACKUP_DIR ?? path.join(DATA_DIR, 'backups');
 
-/** Demo mode exposes seeded credentials on the login page — disabled in production. */
-export const DEMO_MODE = process.env.DEMO_MODE ? process.env.DEMO_MODE === 'true' : !IS_PROD;
+/**
+ * Mode de vérification des licences. En production, seules les API réelles
+ * (Steam / Epic) sont interrogées ; `PLATFORM_MODE=fixture` n'est accepté que
+ * hors production, pour les tests d'intégration.
+ */
+export const PLATFORM_FIXTURES = !IS_PROD && process.env.PLATFORM_MODE === 'fixture';
 
 export const I18N_ACTIVE = ['fr', 'en'] as const;
 export const I18N_MASKED = ['es', 'de', 'it'] as const;

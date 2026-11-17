@@ -10,41 +10,69 @@ v1.3* (17 pages). Chaque section est tracée dans [`docs/CONFORMITE.md`](docs/CO
 
 ## Démarrage
 
+Prérequis : Node 20+, MySQL 8 ou MariaDB 10.6+ (base et utilisateur à créer par
+l'hébergeur).
+
 ```bash
 npm install
-npm run dev          # http://localhost:3000 (front + API, rechargement à chaud)
+cp .env.example .env      # renseigner DATABASE_URL (ou MYSQL_*), SMTP, PUBLIC_ORIGIN…
+npm run db:migrate        # applique le schéma (idempotent)
+npm run admin:create      # crée le premier compte administrateur (CLI)
+npm run dev               # http://localhost:3000 (front + API, rechargement à chaud)
 ```
 
-Premier lancement : la base SQLite `data/mirage.db` est créée, le schéma appliqué et
-le jeu de démonstration inséré (contenus, serveurs, tickets, statistiques, comptes).
+En production :
+
+```bash
+npm run build             # front (dist/client) + serveur (dist/server)
+npm start                 # NODE_ENV=production node dist/server/index.js
+```
+
+**Aucun compte, aucun contenu et aucune donnée de démonstration** n'existent dans
+le code : la base démarre vide, seul le schéma est créé. Le premier
+administrateur est créé exclusivement par `npm run admin:create` (saisie masquée,
+politique de mot de passe renforcée à 14 caractères, 2FA/WebAuthn imposée dès la
+première connexion). Les autres membres du personnel sont ensuite créés depuis le
+back-office, avec leur rôle et leurs droits issus des matrices §11.3/§11.4.
 
 | Commande | Effet |
 | --- | --- |
 | `npm run dev` | Serveur Express + Vite en mode middleware sur le port 3000 |
 | `npm run build` | Compilation du front (`dist/client`) et du serveur (`dist/server`) |
 | `npm start` | Exécution de la version compilée en `NODE_ENV=production` |
+| `npm run db:migrate` | Crée / met à jour le schéma sur la base configurée |
+| `npm run admin:create` | Crée un administrateur (première entrée du personnel) |
 | `npm test` | 121 tests : critères §6.14, matrices §11.3/§11.4, rendu des pages |
 | `npm run backup:verify` | Crée une sauvegarde chiffrée et vérifie sa restauration |
 
-## Comptes de démonstration
+### Base de données
 
-| Rôle | Identifiant | Mot de passe | Second facteur |
-| --- | --- | --- | --- |
-| Administrateur | `admin` | `Mirage-Staff-2026` | TOTP `JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP` |
-| Modérateur | `moderator` | `Mirage-Staff-2026` | même secret TOTP |
-| Traducteur | `translator` | `Mirage-Staff-2026` | même secret TOTP |
-| Rédacteur | `writer` | `Mirage-Staff-2026` | même secret TOTP |
-| Game Designer | `game_designer` | `Mirage-Staff-2026` | même secret TOTP |
-| Animateur | `animator` | `Mirage-Staff-2026` | même secret TOTP |
-| Développeur | `dev` | `Mirage-Staff-2026` | même secret TOTP |
-| Community Manager | `community_manager` | `Mirage-Staff-2026` | même secret TOTP |
-| Joueur (profil public) | `joueur` | `Mirage-Demo-2026` | — |
-| Joueur (profil privé) | `recrue` | `Mirage-Demo-2026` | — |
+L'application parle à **MySQL/MariaDB** via `mysql2` (`DATABASE_URL` ou
+`MYSQL_HOST` / `MYSQL_PORT` / `MYSQL_USER` / `MYSQL_PASSWORD` / `MYSQL_DATABASE`,
+`DB_SSL=true` pour un serveur géré, `DB_POOL_SIZE` pour le pool). Le schéma
+complet — 26 tables, index, contraintes — est défini dans `server/db/schema.ts`
+et décliné pour les deux dialectes. La couche d'accès est entièrement
+asynchrone et les transactions sont liées à leur connexion (`AsyncLocalStorage`).
 
-> Le second facteur se saisit sur l'écran de connexion après le mot de passe. Le
-> secret ci-dessus est à importer dans une application TOTP (ou à générer avec
-> `oathtool --totp -b JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP`). Ces identifiants
-> n'existent qu'en démonstration : `DEMO_MODE` est désactivé en production.
+SQLite (`better-sqlite3`, `DB_PATH`) reste disponible **uniquement** pour le
+développement local, les tests automatisés et la restauration vérifiée des
+sauvegardes ; il n'est jamais sélectionné en production.
+
+### E-mails
+
+Les e-mails transactionnels (réinitialisation de mot de passe, accusé de réception
+d'un ticket, alerte au support) partent via `SMTP_URL` ou `SMTP_HOST`/`SMTP_PORT`/
+`SMTP_USER`/`SMTP_PASS`. Sans configuration SMTP, l'application démarre quand même
+et journalise un avertissement : aucun jeton n'est jamais exposé dans la réponse
+HTTP.
+
+### Sauvegardes
+
+`POST` du back-office ou `npm run backup:verify` produisent une archive
+`.zmbk1` (instantané logique + AES-256-GCM) dans `BACKUP_DIR`. La commande
+restaure réellement l'archive dans une base SQLite en mémoire et sort en erreur
+si un contrôle échoue. `BACKUP_ENCRYPTION_KEY` doit être conservée hors du
+serveur : sans elle, les archives sont définitivement illisibles.
 
 Back-office : **`/console-mirage`** (chemin non standard, §6.9.3). Toute requête sur
 `/admin`, `/wp-admin`, `/administrator`, `/backoffice`, `/console` renvoie 404.
@@ -55,11 +83,14 @@ Back-office : **`/console-mirage`** (chemin non standard, §6.9.3). Toute requê
 server/
   index.ts          assemblage Express, en-têtes, CSRF, fallback SPA, housekeeping
   config.ts         constantes de sécurité (sessions, reauth, délais, chemins)
-  db.ts             schéma SQLite complet + seed de démonstration
+  db/               couche de données : types, dialecte, schéma, pilote SQLite,
+                    pilote MySQL, ouverture/migration/instantanés
   lib/              ids, password, totp, webauthn, rbac, sessions, licences,
-                    ssrf, sanitize, audit, throttle, backup, discord, platform
+                    ssrf, sanitize, audit, throttle, backup, discord, platform,
+                    mailer, oauth
   middleware/       security (CSP/HSTS/CSRF/origine), auth (sessions, rôles)
   routes/           auth, account, servers, support, admin, api.v1, public
+  scripts/          migrate, createAdmin, verifyBackup
 src/
   pages/            23 pages publiques et compte
   admin/            back-office (tableau de bord, contenus, utilisateurs,
@@ -67,7 +98,7 @@ src/
   components/       primitives UI, layout, rendu Markdown assaini
   i18n/             fr, en (es/de/it masquées sous le seuil de traduction)
   styles.css        thème noir/rouge, scanlines terminal désactivables
-tests/              121 tests (sécurité, matrices, rendu React)
+tests/              121 tests (sécurité, matrices, rendu React) + fixtures
 ```
 
 ## Sécurité — points saillants

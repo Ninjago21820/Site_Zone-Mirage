@@ -10,7 +10,7 @@ implémentation. Les chemins sont relatifs à la racine du dépôt.
 | 3 | Périmètre exclu (paiement, launcher, manifeste, sanctions, achats intégrés, newsletter) | `server/routes/public.ts` (`/api/store` → `payment:false`, `launcher:false`), aucune route de paiement | `tests/security.test.ts` (« n'expose ni paiement ni launcher ») |
 | 4 | Navigation : Accueil, Actualités, Roadmap, Carte, Wiki, Boutique, Serveurs + Classements, FAQ, Support, Maintenance, Compte, Profil, pages légales, back-office, API | `src/App.tsx` (23 routes), `server/routes/public.ts`, `server/routes/api.v1.ts` | `tests/render.test.tsx` (26 routes) |
 | 4 | Catégories d'actualités `[à définir]` | `src/pages/News.tsx` (liste des catégories servie par l'API, placeholder explicite) | `/api/content/news` |
-| 5.1 | Connexion e-mail/mot de passe + OAuth2/OIDC PKCE (Discord, Steam, Epic, Google) | `server/routes/auth.ts` (`/api/auth/oauth/:provider/start|callback`, `state` + `nonce` + PKCE) | « refuse un state OAuth inconnu » |
+| 5.1 | Connexion e-mail/mot de passe + OAuth2/OIDC PKCE (Discord, Steam, Epic, Google) | `server/lib/oauth.ts` (échange serveur-à-serveur du code + userinfo), `server/routes/auth.ts` (`/api/auth/oauth/:provider/start|callback`, `state` + `nonce` + PKCE) ; fournisseur non configuré → `503 provider_not_configured` | « refuse un state OAuth inconnu », « bloque la connexion externe seule pour le personnel » |
 | 5.2 | Mirage ID `MIRAGE:A.BB.<18 chiffres>`, immuable, unique, réservé à vie | `server/lib/ids.ts` (`mirageIdFor`), table `reserved_mirage_ids` | « respecte le format », « réserve définitivement » |
 | 5.3 | Aucune liaison automatique par e-mail ; liaison = session authentifiée + réauth < 5 min ; pas de connexion staff par fournisseur externe | `server/routes/auth.ts` (callback crée toujours un compte ou exige `link=1` + réauth) | « crée un nouveau compte au lieu de lier », « bloque la connexion externe seule » |
 | 5.3 | Comptes Steam sans e-mail → demande d'ajout | `server/routes/auth.ts` (redirection `needsEmail=1`), `src/pages/OAuthMock.tsx` | « crée un nouveau compte… » |
@@ -26,7 +26,7 @@ implémentation. Les chemins sont relatifs à la racine du dépôt.
 | 6.8 | Réauthentification < 5 min pour toute action sensible | `server/middleware/auth.ts` (`requireReauth`), `src/components/ui.tsx` (`ReauthModal`) | « exige une réauthentification récente » |
 | 6.9 | Contrôles d'accès serveur, chemin back-office non standard, 404 sur les chemins devinables | `server/index.ts` (`RESERVED_ADMIN_PATHS`), `server/lib/rbac.ts` | « renvoie 404 sur /admin », « refuse l'accès au back-office », « matrice : un rédacteur… » |
 | 6.10 | Jeton de réinitialisation haché 256 bits, invalide les précédents, ne contourne pas la 2FA | `server/routes/auth.ts` (`/api/auth/password/forgot|reset`), table `password_reset_tokens` | « émet un jeton 30 min… », « conserve l'obligation de 2FA » |
-| 6.11 | Sauvegarde chiffrée + restauration vérifiée | `server/lib/backup.ts`, `server/scripts/verifyBackup.ts` | « chiffre la sauvegarde », « détecte une sauvegarde corrompue », `npm run backup:verify` |
+| 6.11 | Sauvegarde chiffrée + restauration vérifiée | `server/lib/backup.ts` (instantané logique ZMBK1, AES-256-GCM, restauration réelle en base mémoire), `server/scripts/verifyBackup.ts` | « chiffre la sauvegarde », « détecte une sauvegarde corrompue », `npm run backup:verify` |
 | 6.12 | Journal d'audit append-only, 12 mois, IP tronquée après 30 jours | `server/lib/audit.ts`, `src/admin/System.tsx` | « chaîne de hachage valide puis détecte une altération », « tronque l'adresse IP » |
 | 6.13 | CSP/HSTS/CSRF/XSS, assainissement, SSRF, interactions Discord Ed25519 | `server/middleware/security.ts`, `server/lib/sanitize.ts`, `server/lib/ssrf.ts`, `server/lib/discord.ts` | « en-têtes de sécurité stricts », « assainit le HTML », « refuse les interactions Discord non signées » |
 | 6.14 | Les 11 critères d'acceptation | `server/routes/admin.ts` (`/api/backoffice/criteria`), `src/admin/Security.tsx` | « renvoie onze critères évalués » + 24 tests dédiés |
@@ -53,4 +53,6 @@ implémentation. Les chemins sont relatifs à la racine du dépôt.
 | Carte de la Zone Mirage | Plan et graphe **explicitement provisoires** (5 étages, 27 nœuds, 32 arêtes) |
 | Logos et illustrations | Aucun logo officiel inventé ; favicon géométrique neutre |
 | Passerelle de paiement, launcher, newsletter | Volontairement absents (§3, §12.4) |
-| Fournisseurs OAuth réels | Flux PKCE complet côté serveur, callback de démonstration `/oauth/:provider/callback` |
+| Fournisseurs OAuth réels | Flux PKCE complet (échange du code + lecture userinfo côté serveur) ; Steam (OpenID) et Epic (EOS) exigent leurs endpoints explicites, sinon le fournisseur reste inactif (`503 provider_not_configured`) |
+| Comptes de démonstration | Aucun : la base démarre vide, le premier administrateur est créé par `npm run admin:create` |
+| SMTP | Sans configuration SMTP, les e-mails sont journalisés en avertissement et aucune donnée sensible n'est renvoyée au client |

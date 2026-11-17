@@ -36,20 +36,15 @@ function shape(row: Record<string, any>) {
 export function serverRoutes(db: DB): Router {
   const router = Router();
 
-  router.get('/mine', requireAuth, (req, res) => {
-    const rows = db.prepare('SELECT * FROM servers WHERE owner_id = ? AND deleted_at IS NULL ORDER BY created_at DESC')
-      .all(req.user!.id) as Record<string, any>[];
+  router.get('/mine', requireAuth, async (req, res) => {
+    const rows = await db.all('SELECT * FROM servers WHERE owner_id = ? AND deleted_at IS NULL ORDER BY created_at DESC', [req.user!.id]) as Record<string, any>[];
     // §7 — alert the creator when a server has been offline for more than 14 days.
     for (const row of rows) {
       const offlineDays = row.last_online_at ? Math.floor((Date.now() - row.last_online_at) / 86400000) : 0;
       if (offlineDays > OFFLINE_ALERT_DAYS) {
-        const existing = db.prepare("SELECT 1 AS hit FROM notifications WHERE user_id = ? AND kind = ? AND body LIKE ?")
-          .get(req.user!.id, 'server_offline', `%${row.id}%`);
+        const existing = await db.get("SELECT 1 AS hit FROM notifications WHERE user_id = ? AND kind = ? AND body LIKE ?", [req.user!.id, 'server_offline', `%${row.id}%`]);
         if (!existing) {
-          db.prepare('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)')
-            .run(newId('ntf'), req.user!.id, 'server_offline',
-              `Votre serveur ${row.name} (${row.id}) est hors ligne depuis ${offlineDays} jours. Mettez-le à jour ou retirez-le du référencement.`,
-              Date.now());
+          await db.run('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)', [newId('ntf'), req.user!.id, 'server_offline', `Votre serveur ${row.name} (${row.id}) est hors ligne depuis ${offlineDays} jours. Mettez-le à jour ou retirez-le du référencement.`, Date.now()]);
         }
       }
     }
@@ -69,7 +64,7 @@ export function serverRoutes(db: DB): Router {
     if (!rateLimit(`server-create:${req.user!.id}`, 10, 60 * 60 * 1000)) {
       return res.status(429).json({ error: 'rate_limited' });
     }
-    const count = db.prepare('SELECT COUNT(*) AS c FROM servers WHERE owner_id = ? AND deleted_at IS NULL').get(req.user!.id) as { c: number };
+    const count = await db.get('SELECT COUNT(*) AS c FROM servers WHERE owner_id = ? AND deleted_at IS NULL', [req.user!.id]) as { c: number };
     if (count.c >= MAX_SERVERS_PER_USER) {
       return res.status(409).json({ error: 'server_limit', message: 'Limite de trois serveurs par compte atteinte.' });
     }
@@ -87,13 +82,11 @@ export function serverRoutes(db: DB): Router {
 
     const id = newId('srv');
     const now = Date.now();
-    db.prepare(`INSERT INTO servers
+    await db.run(`INSERT INTO servers
       (id,owner_id,name,description,host,port,region,tag,status,maintenance,current_players,avg_players,max_players,last_online_at,created_at)
-      VALUES (?,?,?,?,?,?,?,?, 'pending', 0, 0, 0, ?, ?, ?)`)
-      .run(id, req.user!.id, name, String(body.description ?? '').slice(0, 400), target.host!.toLowerCase(), target.port!,
-        String(body.region ?? '').slice(0, 8), '', Number(body.maxPlayers ?? 24) || 24, now, now);
+      VALUES (?,?,?,?,?,?,?,?, 'pending', 0, 0, 0, ?, ?, ?)`, [id, req.user!.id, name, String(body.description ?? '').slice(0, 400), target.host!.toLowerCase(), target.port!, String(body.region ?? '').slice(0, 8), '', Number(body.maxPlayers ?? 24) || 24, now, now]);
 
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'server.created', targetType: 'server',
       targetId: id, ipTrunc: req.ipTrunc, meta: { host: target.host, port: target.port, addresses: target.addresses },
     });
@@ -108,8 +101,7 @@ export function serverRoutes(db: DB): Router {
   });
 
   router.patch('/:id', requireAuth, requireReauth, async (req, res) => {
-    const row = db.prepare('SELECT * FROM servers WHERE id = ? AND owner_id = ? AND deleted_at IS NULL')
-      .get(req.params.id, req.user!.id) as Record<string, any> | undefined;
+    const row = await db.get('SELECT * FROM servers WHERE id = ? AND owner_id = ? AND deleted_at IS NULL', [String(req.params.id), req.user!.id]) as Record<string, any> | undefined;
     if (!row) return res.status(404).json({ error: 'not_found' });
     const body = req.body ?? {};
     const updates: Record<string, unknown> = {};
@@ -138,38 +130,38 @@ export function serverRoutes(db: DB): Router {
     if (!Object.keys(updates).length) return res.status(400).json({ error: 'no_changes' });
 
     const fields = Object.keys(updates).map((k) => `${k} = @${k}`).join(', ');
-    db.prepare(`UPDATE servers SET ${fields} WHERE id = @id`).run({ ...updates, id: row.id });
-    appendAudit(db, {
+    await db.run(`UPDATE servers SET ${fields} WHERE id = @id`, [{ ...updates, id: row.id }]);
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'server.updated', targetType: 'server',
       targetId: row.id, ipTrunc: req.ipTrunc, meta: { fields: Object.keys(updates) },
     });
-    const updated = db.prepare('SELECT * FROM servers WHERE id = ?').get(row.id) as Record<string, any>;
+    const updated = await db.get('SELECT * FROM servers WHERE id = ?', [row.id]) as Record<string, any>;
     res.json({ ok: true, server: shape(updated) });
   });
 
-  router.post('/:id/maintenance', requireAuth, requireReauth, (req, res) => {
-    const row = db.prepare('SELECT * FROM servers WHERE id = ? AND deleted_at IS NULL').get(req.params.id) as Record<string, any> | undefined;
+  router.post('/:id/maintenance', requireAuth, requireReauth, async (req, res) => {
+    const row = await db.get('SELECT * FROM servers WHERE id = ? AND deleted_at IS NULL', [String(req.params.id)]) as Record<string, any> | undefined;
     if (!row) return res.status(404).json({ error: 'not_found' });
     const isOwner = row.owner_id === req.user!.id;
     const isStaff = canFunction(req.user!.role as never, 'server_validation');
     if (!isOwner && !isStaff) return res.status(403).json({ error: 'forbidden' });
     const next = row.maintenance ? 0 : 1;
-    db.prepare('UPDATE servers SET maintenance = ? WHERE id = ?').run(next, row.id);
-    appendAudit(db, {
+    await db.run('UPDATE servers SET maintenance = ? WHERE id = ?', [next, row.id]);
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'server.maintenance',
       targetType: 'server', targetId: row.id, ipTrunc: req.ipTrunc, meta: { maintenance: !!next },
     });
     res.json({ ok: true, maintenance: !!next });
   });
 
-  router.delete('/:id', requireAuth, requireReauth, (req, res) => {
-    const row = db.prepare('SELECT * FROM servers WHERE id = ? AND deleted_at IS NULL').get(req.params.id) as Record<string, any> | undefined;
+  router.delete('/:id', requireAuth, requireReauth, async (req, res) => {
+    const row = await db.get('SELECT * FROM servers WHERE id = ? AND deleted_at IS NULL', [String(req.params.id)]) as Record<string, any> | undefined;
     if (!row) return res.status(404).json({ error: 'not_found' });
     const isOwner = row.owner_id === req.user!.id;
     const isStaff = canFunction(req.user!.role as never, 'server_validation');
     if (!isOwner && !isStaff) return res.status(403).json({ error: 'forbidden' });
-    db.prepare('UPDATE servers SET deleted_at = ? WHERE id = ?').run(Date.now(), row.id);
-    appendAudit(db, {
+    await db.run('UPDATE servers SET deleted_at = ? WHERE id = ?', [Date.now(), row.id]);
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'server.deleted',
       targetType: 'server', targetId: row.id, ipTrunc: req.ipTrunc,
     });
@@ -177,14 +169,13 @@ export function serverRoutes(db: DB): Router {
   });
 
   /* ------------------------- staff moderation ------------------------- */
-  router.get('/queue', requireStaff, requireFunction('server_validation'), (req, res) => {
-    const rows = db.prepare("SELECT * FROM servers WHERE deleted_at IS NULL AND status IN ('pending','suspended') ORDER BY created_at ASC")
-      .all() as Record<string, any>[];
+  router.get('/queue', requireStaff, requireFunction('server_validation'), async (req, res) => {
+    const rows = await db.all("SELECT * FROM servers WHERE deleted_at IS NULL AND status IN ('pending','suspended') ORDER BY created_at ASC") as Record<string, any>[];
     res.json({ servers: rows.map((r) => ({ ...shape(r), ownerId: r.owner_id })) });
   });
 
   router.post('/:id/validate', requireStaff, requireFunction('server_validation'), async (req, res) => {
-    const row = db.prepare('SELECT * FROM servers WHERE id = ? AND deleted_at IS NULL').get(req.params.id) as Record<string, any> | undefined;
+    const row = await db.get('SELECT * FROM servers WHERE id = ? AND deleted_at IS NULL', [String(req.params.id)]) as Record<string, any> | undefined;
     if (!row) return res.status(404).json({ error: 'not_found' });
     const approve = req.body?.approve !== false;
     const reason = String(req.body?.reason ?? '').slice(0, 300);
@@ -198,19 +189,15 @@ export function serverRoutes(db: DB): Router {
     }
     const now = Date.now();
     if (approve) {
-      db.prepare("UPDATE servers SET status = 'active', validated_at = ?, validated_by = ?, last_online_at = ? WHERE id = ?")
-        .run(now, req.user!.id, now, row.id);
+      await db.run("UPDATE servers SET status = 'active', validated_at = ?, validated_by = ?, last_online_at = ? WHERE id = ?", [now, req.user!.id, now, row.id]);
     } else {
-      db.prepare("UPDATE servers SET status = 'suspended', validated_by = ? WHERE id = ?").run(req.user!.id, row.id);
+      await db.run("UPDATE servers SET status = 'suspended', validated_by = ? WHERE id = ?", [req.user!.id, row.id]);
     }
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: approve ? 'server.validated' : 'server.suspended',
       targetType: 'server', targetId: row.id, ipTrunc: req.ipTrunc, meta: { reason },
     });
-    db.prepare('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)')
-      .run(newId('ntf'), row.owner_id, 'server_moderation',
-        approve ? `Votre serveur ${row.name} a été validé et publié.` : `Votre serveur ${row.name} a été suspendu. Motif : ${reason}`,
-        now);
+    await db.run('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)', [newId('ntf'), row.owner_id, 'server_moderation', approve ? `Votre serveur ${row.name} a été validé et publié.` : `Votre serveur ${row.name} a été suspendu. Motif : ${reason}`, now]);
     res.json({ ok: true, status: approve ? 'active' : 'suspended' });
   });
 

@@ -2,8 +2,9 @@ import { Router, type Request, type Response } from 'express';
 import argon2 from 'argon2';
 import { createHash, randomBytes } from 'node:crypto';
 import type { DB } from '../db.js';
+import { OAUTH_PROVIDERS, authorizeUrl, exchangeOAuthCode, providerConfig, OAuthError, type OAuthProvider } from '../lib/oauth.js';
 import {
-  SESSION_COOKIE, CSRF_COOKIE, IS_PROD, COOKIE_PATH, DEMO_MODE, RP_ID, RP_NAME,
+  SESSION_COOKIE, CSRF_COOKIE, IS_PROD, COOKIE_PATH, RP_ID, RP_NAME,
   EXPECTED_ORIGIN, PASSWORD_RESET_TTL_MS, TWOFA_RECOVERY_DELAY_MS,
 } from '../config.js';
 import {
@@ -17,6 +18,7 @@ import {
   describeSession, isStaffRole, contextHash,
 } from '../lib/sessions.js';
 import { appendAudit } from '../lib/audit.js';
+import { isMailConfigured, sendPasswordReset } from '../lib/mailer.js';
 import {
   applyLoginDelay, clearFailures, failureCount, recordFailure, requiresChallenge, rateLimit,
 } from '../lib/throttle.js';
@@ -77,9 +79,9 @@ function ok(res: Response, body: Record<string, unknown> = {}) {
   res.status(200).json({ ok: true, ...body });
 }
 
-function sessionPayload(db: DB, user: PublicUser) {
+async function sessionPayload(db: DB, user: PublicUser) {
   return {
-    user: profileView(db, user, user.id),
+    user: await profileView(db, user, user.id),
     role: user.role,
     staff: isStaffRole(user.role),
     mirageId: user.mirage_id,
@@ -95,29 +97,6 @@ export function authRoutes(db: DB): Router {
    * ---------------------------------------------------------------- */
   router.get('/challenge', (_req, res) => {
     res.json({ ...challengeConfig(), token: issueChallengeToken() });
-  });
-
-  /* ---------------------------------------------------------------- *
-   * Demo helpers — disabled outside DEMO_MODE
-   * ---------------------------------------------------------------- */
-  router.get('/demo', (req, res) => {
-    if (!DEMO_MODE) return res.status(404).json({ error: 'not_found' });
-    const accounts = db.prepare("SELECT username, role FROM users WHERE status = 'active' ORDER BY role = 'player', username")
-      .all() as { username: string; role: string }[];
-    res.json({
-      enabled: true,
-      password: { player: 'Mirage-Demo-2026', staff: 'Mirage-Staff-2026' },
-      accounts: accounts.map((a) => ({ username: a.username, role: a.role, staff: a.role !== 'player' })),
-      note: 'Environnement de démonstration. Comptes et données fictifs, aucune donnée réelle.',
-    });
-  });
-
-  router.get('/demo/totp', (req, res) => {
-    if (!DEMO_MODE) return res.status(404).json({ error: 'not_found' });
-    const username = String(req.query.username ?? '');
-    const user = findUserByIdentifier(db, username);
-    if (!user?.totp_secret) return res.status(404).json({ error: 'not_found' });
-    res.json({ code: totpAt(user.totp_secret), period: 30 });
   });
 
   /* ---------------------------------------------------------------- *
@@ -143,8 +122,7 @@ export function authRoutes(db: DB): Router {
     if (!USERNAME_RE.test(username)) return res.status(409).json(generic);
     if (!EMAIL_RE.test(email) || email.length > 254) return res.status(409).json(generic);
 
-    const existing = db.prepare('SELECT 1 AS hit FROM users WHERE lower(username) = lower(?) OR lower(email) = lower(?)')
-      .get(username, email);
+    const existing = await db.get('SELECT 1 AS hit FROM users WHERE lower(username) = lower(?) OR lower(email) = lower(?)', [username, email]);
     if (existing) return res.status(409).json(generic);
 
     const policy = await evaluatePassword(password, { staff: false, identifiers: [username, email] });
@@ -160,18 +138,16 @@ export function authRoutes(db: DB): Router {
 
     const now = Date.now();
     const id = newId('usr');
-    const mirageId = mirageIdFor(db, now);
-    db.prepare(`INSERT INTO users
+    const mirageId = await mirageIdFor(db, now);
+    await db.run(`INSERT INTO users
       (id,mirage_id,username,email,password_hash,role,status,email_verified,locale,profile_public,show_socials,socials_json,bio,created_at,updated_at)
-      VALUES (?,?,?,?,?,'player','active',0,?,0,0,'{}','',?,?)`)
-      .run(id, mirageId, username, email, await hashPassword(password), locale, now, now);
+      VALUES (?,?,?,?,?,'player','active',0,?,0,0,'{}','',?,?)`, [id, mirageId, username, email, await hashPassword(password), locale, now, now]);
 
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: id, actorRole: 'player', action: 'account.created', targetType: 'user', targetId: id,
       ipTrunc: req.ipTrunc, meta: { mirageId, locale },
     });
-    db.prepare('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)')
-      .run(newId('ntf'), id, 'welcome', 'Bienvenue sur le site officiel de SCP: Mirage Protocol.', now);
+    await db.run('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)', [newId('ntf'), id, 'welcome', 'Bienvenue sur le site officiel de SCP: Mirage Protocol.', now]);
 
     res.status(201).json({ ok: true, mirageId, username });
   });
@@ -198,7 +174,7 @@ export function authRoutes(db: DB): Router {
     const ipKey = `ip:${sha256(ip)}`;
     const keys = [identKey, ipKey];
 
-    if (requiresChallenge(identKey) || requiresChallenge(ipKey)) {
+    if (await requiresChallenge(identKey) || await requiresChallenge(ipKey)) {
       const valid = await verifyChallenge(body, ip);
       if (!valid) {
         return res.status(403).json({
@@ -211,50 +187,48 @@ export function authRoutes(db: DB): Router {
     }
 
     await applyLoginDelay(keys);
-    const user = findUserByIdentifier(db, identifier);
+    const user = await findUserByIdentifier(db, identifier);
 
     if (!user) {
       // Burn comparable CPU time so unknown accounts cannot be distinguished by timing.
       await verifyPassword(await DUMMY_HASH, password || 'x');
-      recordFailure(identKey);
-      recordFailure(ipKey);
-      db.prepare('INSERT INTO login_attempts (at,ident_hash,ip_hash,success,reason) VALUES (?,?,?,?,?)')
-        .run(Date.now(), sha256(identifier.toLowerCase()), sha256(ip), 0, 'unknown');
+      await recordFailure(identKey);
+      await recordFailure(ipKey);
+      await db.run('INSERT INTO login_attempts (at,ident_hash,ip_hash,success,reason) VALUES (?,?,?,?,?)', [Date.now(), sha256(identifier.toLowerCase()), sha256(ip), 0, 'unknown']);
       return res.status(401).json({ error: 'invalid_credentials', message: GENERIC_LOGIN });
     }
 
     const passwordOk = await verifyPassword(user.password_hash, password);
     if (!passwordOk) {
-      recordFailure(identKey);
-      recordFailure(ipKey);
-      db.prepare('INSERT INTO login_attempts (at,ident_hash,ip_hash,success,reason) VALUES (?,?,?,?,?)')
-        .run(Date.now(), sha256(identifier.toLowerCase()), sha256(ip), 0, 'password');
+      await recordFailure(identKey);
+      await recordFailure(ipKey);
+      await db.run('INSERT INTO login_attempts (at,ident_hash,ip_hash,success,reason) VALUES (?,?,?,?,?)', [Date.now(), sha256(identifier.toLowerCase()), sha256(ip), 0, 'password']);
       if (process.env.NODE_ENV !== 'test') {
-        appendAudit(db, {
+        await appendAudit(db, {
           actorId: user.id, actorRole: user.role, action: 'auth.login_failed',
           targetType: 'user', targetId: user.id, ipTrunc: req.ipTrunc,
-          meta: { attempt: failureCount(identKey) },
+          meta: { attempt: await failureCount(identKey) },
         });
       }
       return res.status(401).json({ error: 'invalid_credentials', message: GENERIC_LOGIN });
     }
 
     if (user.status === 'banned' || user.status === 'suspended') {
-      recordFailure(identKey);
+      await recordFailure(identKey);
       return res.status(403).json({ error: 'account_restricted', message: 'Connexion refusée. Contactez le support.' });
     }
 
     clearFailures(identKey);
     const staff = isStaffRole(user.role);
     const needsSecondFactor = staff || !!user.totp_secret ||
-      (db.prepare('SELECT COUNT(*) AS c FROM webauthn_credentials WHERE user_id = ?').get(user.id) as { c: number }).c > 0;
+      (await db.get('SELECT COUNT(*) AS c FROM webauthn_credentials WHERE user_id = ?', [user.id]) as { c: number }).c > 0;
 
     const ua = req.get('user-agent') ?? '';
     if (needsSecondFactor) {
-      const { token, session } = createSession(db, { userId: user.id, role: user.role, ip, userAgent: ua, mfaVerified: false });
+      const { token, session } = await createSession(db, { userId: user.id, role: user.role, ip, userAgent: ua, mfaVerified: false });
       setSessionCookies(res, token, session.csrf_token);
-      const passkeys = db.prepare('SELECT COUNT(*) AS c FROM webauthn_credentials WHERE user_id = ?').get(user.id) as { c: number };
-      appendAudit(db, {
+      const passkeys = await db.get('SELECT COUNT(*) AS c FROM webauthn_credentials WHERE user_id = ?', [user.id]) as { c: number };
+      await appendAudit(db, {
         actorId: user.id, actorRole: user.role, action: 'auth.password_ok', targetType: 'user',
         targetId: user.id, ipTrunc: req.ipTrunc, meta: { stage: 'second_factor_required' },
       });
@@ -267,16 +241,15 @@ export function authRoutes(db: DB): Router {
       });
     }
 
-    const { token, session } = createSession(db, { userId: user.id, role: user.role, ip, userAgent: ua, mfaVerified: true });
+    const { token, session } = await createSession(db, { userId: user.id, role: user.role, ip, userAgent: ua, mfaVerified: true });
     setSessionCookies(res, token, session.csrf_token);
-    db.prepare('UPDATE users SET failed_count = 0, reauth_at = ? WHERE id = ?').run(Date.now(), user.id);
-    db.prepare('INSERT INTO login_attempts (at,ident_hash,ip_hash,success,reason) VALUES (?,?,?,?,?)')
-      .run(Date.now(), sha256(identifier.toLowerCase()), sha256(ip), 1, null);
-    appendAudit(db, {
+    await db.run('UPDATE users SET failed_count = 0, reauth_at = ? WHERE id = ?', [Date.now(), user.id]);
+    await db.run('INSERT INTO login_attempts (at,ident_hash,ip_hash,success,reason) VALUES (?,?,?,?,?)', [Date.now(), sha256(identifier.toLowerCase()), sha256(ip), 1, null]);
+    await appendAudit(db, {
       actorId: user.id, actorRole: user.role, action: 'auth.login', targetType: 'session',
       targetId: session.id.slice(0, 12), ipTrunc: req.ipTrunc, meta: { device: session.device_label },
     });
-    ok(res, { mfaRequired: false, ...sessionPayload(db, user) });
+    ok(res, { mfaRequired: false, ...await sessionPayload(db, user) });
   });
 
   /** Second factor stage: TOTP, backup code, or a passkey assertion. */
@@ -284,14 +257,14 @@ export function authRoutes(db: DB): Router {
     const token = readCookie(req, SESSION_COOKIE);
     if (!token) return res.status(401).json({ error: 'auth_required' });
     const id = sha256(token);
-    const session = db.prepare('SELECT * FROM sessions WHERE id = ? AND revoked_at IS NULL').get(id) as
+    const session = await db.get('SELECT * FROM sessions WHERE id = ? AND revoked_at IS NULL', [id]) as
       | { id: string; user_id: string; mfa_verified: number; expires_at: number; absolute_expires_at: number; csrf_token: string }
       | undefined;
     if (!session || Date.now() > session.expires_at || Date.now() > session.absolute_expires_at) {
       clearSessionCookies(res);
       return res.status(401).json({ error: 'auth_required' });
     }
-    const user = findUserById(db, session.user_id);
+    const user = await findUserById(db, session.user_id);
     if (!user) return res.status(401).json({ error: 'auth_required' });
 
     const body = req.body ?? {};
@@ -302,10 +275,9 @@ export function authRoutes(db: DB): Router {
     let method = '';
 
     if (typeof body.code === 'string' && body.code.trim()) {
-      const result = verifyTotp(user.totp_secret, body.code, user.totp_last_step);
+      const result = verifyTotp(user.totp_secret, body.code, user.totp_last_step ?? null);
       if (result.ok) {
-        db.prepare('UPDATE users SET totp_last_step = ? WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)')
-          .run(result.step, user.id, result.step);
+        await db.run('UPDATE users SET totp_last_step = ? WHERE id = ? AND (totp_last_step IS NULL OR totp_last_step < ?)', [result.step ?? null, user.id, result.step ?? null]);
         accepted = true;
         method = 'totp';
       }
@@ -314,8 +286,7 @@ export function authRoutes(db: DB): Router {
       method = 'backup_code';
     } else if (body.passkey && typeof body.passkey === 'object') {
       try {
-        const cred = db.prepare('SELECT * FROM webauthn_credentials WHERE user_id = ? AND credential_id = ?')
-          .get(user.id, String(body.passkey.id)) as { credential_id: string; public_key: string; counter: number } | undefined;
+        const cred = await db.get('SELECT * FROM webauthn_credentials WHERE user_id = ? AND credential_id = ?', [user.id, String(body.passkey.id)]) as { credential_id: string; public_key: string; counter: number } | undefined;
         if (cred) {
           const cose = JSON.parse(cred.public_key);
           const result = verifyAssertion({
@@ -328,7 +299,7 @@ export function authRoutes(db: DB): Router {
             cose,
             storedCounter: cred.counter,
           });
-          db.prepare('UPDATE webauthn_credentials SET counter = ? WHERE credential_id = ?').run(result.counter, cred.credential_id);
+          await db.run('UPDATE webauthn_credentials SET counter = ? WHERE credential_id = ?', [result.counter, cred.credential_id]);
           accepted = true;
           method = 'passkey';
         }
@@ -338,31 +309,31 @@ export function authRoutes(db: DB): Router {
     }
 
     if (!accepted) {
-      recordFailure(key);
-      appendAudit(db, {
+      await recordFailure(key);
+      await appendAudit(db, {
         actorId: user.id, actorRole: user.role, action: 'auth.mfa_failed', targetType: 'user',
         targetId: user.id, ipTrunc: req.ipTrunc, meta: { method: method || 'unknown' },
       });
       return res.status(401).json({ error: 'invalid_second_factor', message: 'Code de vérification invalide.' });
     }
 
-    markMfaVerified(db, session.id);
+    await markMfaVerified(db, session.id);
     clearFailures(key);
-    db.prepare('UPDATE users SET reauth_at = ?, failed_count = 0 WHERE id = ?').run(Date.now(), user.id);
-    appendAudit(db, {
+    await db.run('UPDATE users SET reauth_at = ?, failed_count = 0 WHERE id = ?', [Date.now(), user.id]);
+    await appendAudit(db, {
       actorId: user.id, actorRole: user.role, action: 'auth.login', targetType: 'session',
       targetId: session.id.slice(0, 12), ipTrunc: req.ipTrunc, meta: { method },
     });
-    ok(res, { mfaVerified: true, ...sessionPayload(db, user) });
+    ok(res, { mfaVerified: true, ...await sessionPayload(db, user) });
   });
 
   /* ---------------------------------------------------------------- *
    * Logout / reauth / me
    * ---------------------------------------------------------------- */
-  router.post('/logout', (req, res) => {
+  router.post('/logout', async (req, res) => {
     if (req.session) {
-      revokeSession(db, req.session.id, 'logout');
-      appendAudit(db, {
+      await revokeSession(db, req.session.id, 'logout');
+      await appendAudit(db, {
         actorId: req.user?.id ?? null, actorRole: req.user?.role ?? null, action: 'auth.logout',
         targetType: 'session', targetId: req.session.id.slice(0, 12), ipTrunc: req.ipTrunc,
       });
@@ -371,13 +342,13 @@ export function authRoutes(db: DB): Router {
     ok(res);
   });
 
-  router.get('/me', (req, res) => {
+  router.get('/me', async (req, res) => {
     if (!req.user) return res.json({ authenticated: false });
     res.json({
       authenticated: true,
       mustEnrollMfa: isStaffRole(req.user.role) && !req.session?.mfa_verified,
       reauthFresh: Date.now() - (req.user.reauth_at ?? 0) < 5 * 60 * 1000,
-      ...sessionPayload(db, req.user),
+      ...await sessionPayload(db, req.user),
       csrfToken: req.session?.csrf_token,
     });
   });
@@ -389,7 +360,7 @@ export function authRoutes(db: DB): Router {
     const code = String(req.body?.code ?? '');
     const okPassword = await verifyPassword(req.user.password_hash, password);
     if (!okPassword) {
-      appendAudit(db, {
+      await appendAudit(db, {
         actorId: req.user.id, actorRole: req.user.role, action: 'auth.reauth_failed',
         targetType: 'user', targetId: req.user.id, ipTrunc: req.ipTrunc,
       });
@@ -400,10 +371,10 @@ export function authRoutes(db: DB): Router {
       if (!result.ok) {
         return res.status(401).json({ error: 'invalid_second_factor', message: 'Code de vérification invalide.' });
       }
-      db.prepare('UPDATE users SET totp_last_step = ? WHERE id = ?').run(result.step, req.user.id);
+      await db.run('UPDATE users SET totp_last_step = ? WHERE id = ?', [result.step ?? null, req.user.id]);
     }
-    setReauth(db, req.user.id);
-    appendAudit(db, {
+    await setReauth(db, req.user.id);
+    await appendAudit(db, {
       actorId: req.user.id, actorRole: req.user.role, action: 'auth.reauth',
       targetType: 'user', targetId: req.user.id, ipTrunc: req.ipTrunc,
     });
@@ -413,11 +384,9 @@ export function authRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Sessions — §6.8
    * ---------------------------------------------------------------- */
-  router.get('/sessions', requireAuth, (req, res) => {
-    const rows = db.prepare(
-      `SELECT id, created_at, last_seen, expires_at, absolute_expires_at, ip_trunc, device_label, user_agent, mfa_verified, revoked_at
-       FROM sessions WHERE user_id = ? ORDER BY last_seen DESC LIMIT 50`,
-    ).all(req.user!.id) as Parameters<typeof describeSession>[0][];
+  router.get('/sessions', requireAuth, async (req, res) => {
+    const rows = await db.all(`SELECT id, created_at, last_seen, expires_at, absolute_expires_at, ip_trunc, device_label, user_agent, mfa_verified, revoked_at
+       FROM sessions WHERE user_id = ? ORDER BY last_seen DESC LIMIT 50`, [req.user!.id]) as Parameters<typeof describeSession>[0][];
     res.json({
       current: req.session?.id,
       policy: isStaffRole(req.user!.role) ? { idleMinutes: 15, absoluteHours: 8 } : { idleDays: 30, absoluteDays: 90 },
@@ -425,22 +394,21 @@ export function authRoutes(db: DB): Router {
     });
   });
 
-  router.post('/sessions/:id/revoke', requireAuth, (req, res) => {
+  router.post('/sessions/:id/revoke', requireAuth, async (req, res) => {
     const prefix = String(req.params.id ?? '');
-    const row = db.prepare('SELECT id FROM sessions WHERE user_id = ? AND id LIKE ?')
-      .get(req.user!.id, `${prefix.replace(/%/g, '')}%`) as { id: string } | undefined;
+    const row = await db.get('SELECT id FROM sessions WHERE user_id = ? AND id LIKE ?', [req.user!.id, `${prefix.replace(/%/g, '')}%`]) as { id: string } | undefined;
     if (!row) return res.status(404).json({ error: 'not_found' });
-    revokeSession(db, row.id, 'user_revoked');
-    appendAudit(db, {
+    await revokeSession(db, row.id, 'user_revoked');
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'session.revoked',
       targetType: 'session', targetId: row.id.slice(0, 12), ipTrunc: req.ipTrunc,
     });
     ok(res);
   });
 
-  router.post('/sessions/revoke-others', requireAuth, (req, res) => {
-    const count = revokeAllForUser(db, req.user!.id, req.session?.id ?? null, 'user_revoked_others');
-    appendAudit(db, {
+  router.post('/sessions/revoke-others', requireAuth, async (req, res) => {
+    const count = await revokeAllForUser(db, req.user!.id, req.session?.id ?? null, 'user_revoked_others');
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'session.revoke_others',
       targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc, meta: { count },
     });
@@ -450,12 +418,10 @@ export function authRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * TOTP — §6.4
    * ---------------------------------------------------------------- */
-  router.get('/2fa/status', requireAuth, (req, res) => {
-    const passkeys = db.prepare('SELECT id, credential_id, label, created_at FROM webauthn_credentials WHERE user_id = ?')
-      .all(req.user!.id) as { id: string; credential_id: string; label: string; created_at: number }[];
-    const backup = db.prepare('SELECT COUNT(*) AS c FROM backup_codes WHERE user_id = ? AND used_at IS NULL').get(req.user!.id) as { c: number };
-    const recovery = db.prepare("SELECT created_at FROM notifications WHERE user_id = ? AND kind = '2fa_recovery' ORDER BY created_at DESC LIMIT 1")
-      .get(req.user!.id) as { created_at: number } | undefined;
+  router.get('/2fa/status', requireAuth, async (req, res) => {
+    const passkeys = await db.all('SELECT id, credential_id, label, created_at FROM webauthn_credentials WHERE user_id = ?', [req.user!.id]) as { id: string; credential_id: string; label: string; created_at: number }[];
+    const backup = await db.get('SELECT COUNT(*) AS c FROM backup_codes WHERE user_id = ? AND used_at IS NULL', [req.user!.id]) as { c: number };
+    const recovery = await db.get("SELECT created_at FROM notifications WHERE user_id = ? AND kind = '2fa_recovery' ORDER BY created_at DESC LIMIT 1", [req.user!.id]) as { created_at: number } | undefined;
     res.json({
       totp: !!req.user!.totp_secret,
       staff: isStaffRole(req.user!.role),
@@ -476,19 +442,19 @@ export function authRoutes(db: DB): Router {
     const url = buildOtpAuthUrl(secret, req.user!.username);
     const qr = await QRCode.toDataURL(url, { margin: 1, width: 240, color: { dark: '#0b0b0d', light: '#ffffff' } });
     // Pending secret is kept out of the user row until the first valid code.
-    db.prepare("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)").run(`totp_pending:${req.user!.id}`, secret);
+    await db.run("INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)", [`totp_pending:${req.user!.id}`, secret]);
     res.json({ secret, otpauth: url, qr, issuer: RP_NAME });
   });
 
   router.post('/2fa/totp/enable', requireAuth, async (req, res) => {
-    const pending = db.prepare('SELECT value FROM settings WHERE key = ?').get(`totp_pending:${req.user!.id}`) as { value: string } | undefined;
+    const pending = await db.get('SELECT value FROM settings WHERE key = ?', [`totp_pending:${req.user!.id}`]) as { value: string } | undefined;
     if (!pending) return res.status(409).json({ error: 'no_pending_secret' });
     const result = verifyTotp(pending.value, String(req.body?.code ?? ''), null);
     if (!result.ok) return res.status(400).json({ error: 'invalid_code', message: 'Code invalide. Vérifiez l’horloge de votre appareil.' });
-    db.prepare('UPDATE users SET totp_secret = ?, totp_last_step = ? WHERE id = ?').run(pending.value, result.step, req.user!.id);
-    db.prepare('DELETE FROM settings WHERE key = ?').run(`totp_pending:${req.user!.id}`);
+    await db.run('UPDATE users SET totp_secret = ?, totp_last_step = ? WHERE id = ?', [pending.value, result.step ?? null, req.user!.id]);
+    await db.run('DELETE FROM settings WHERE key = ?', [`totp_pending:${req.user!.id}`]);
     const codes = await regenerateBackupCodes(db, req.user!.id, req.session?.id ?? null);
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'mfa.totp_enabled',
       targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc,
     });
@@ -507,10 +473,10 @@ export function authRoutes(db: DB): Router {
     if (!passwordOk) return res.status(401).json({ error: 'invalid_credentials', message: GENERIC_LOGIN });
     const result = verifyTotp(req.user!.totp_secret, String(req.body?.code ?? ''), req.user!.totp_last_step);
     if (!result.ok) return res.status(400).json({ error: 'invalid_code' });
-    db.prepare('UPDATE users SET totp_secret = NULL, totp_last_step = NULL WHERE id = ?').run(req.user!.id);
-    db.prepare('DELETE FROM backup_codes WHERE user_id = ?').run(req.user!.id);
-    const revoked = revokeAllForUser(db, req.user!.id, req.session?.id ?? null, 'mfa_changed');
-    appendAudit(db, {
+    await db.run('UPDATE users SET totp_secret = NULL, totp_last_step = NULL WHERE id = ?', [req.user!.id]);
+    await db.run('DELETE FROM backup_codes WHERE user_id = ?', [req.user!.id]);
+    const revoked = await revokeAllForUser(db, req.user!.id, req.session?.id ?? null, 'mfa_changed');
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: role, action: 'mfa.totp_disabled',
       targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc, meta: { revokedSessions: revoked },
     });
@@ -523,9 +489,9 @@ export function authRoutes(db: DB): Router {
     }
     const result = verifyTotp(req.user!.totp_secret, String(req.body?.code ?? ''), req.user!.totp_last_step);
     if (!result.ok) return res.status(400).json({ error: 'invalid_code' });
-    db.prepare('UPDATE users SET totp_last_step = ? WHERE id = ?').run(result.step, req.user!.id);
+    await db.run('UPDATE users SET totp_last_step = ? WHERE id = ?', [result.step ?? null, req.user!.id]);
     const codes = await regenerateBackupCodes(db, req.user!.id, req.session?.id ?? null);
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'mfa.backup_codes_regenerated',
       targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc,
     });
@@ -533,7 +499,7 @@ export function authRoutes(db: DB): Router {
   });
 
   /** Players only: 2FA recovery is delayed by 72 h (§6.4). Staff have no self-service. */
-  router.post('/2fa/recovery', requireAuth, (req, res) => {
+  router.post('/2fa/recovery', requireAuth, async (req, res) => {
     if (isStaffRole(req.user!.role)) {
       return res.status(403).json({
         error: 'forbidden',
@@ -544,9 +510,8 @@ export function authRoutes(db: DB): Router {
       return res.status(409).json({ error: 'mfa_active', message: 'La double authentification est active.' });
     }
     const now = Date.now();
-    db.prepare('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)')
-      .run(newId('ntf'), req.user!.id, '2fa_recovery', 'Demande de récupération 2FA enregistrée.', now);
-    appendAudit(db, {
+    await db.run('INSERT INTO notifications (id,user_id,kind,body,created_at) VALUES (?,?,?,?,?)', [newId('ntf'), req.user!.id, '2fa_recovery', 'Demande de récupération 2FA enregistrée.', now]);
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'mfa.recovery_requested',
       targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc,
     });
@@ -556,8 +521,8 @@ export function authRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * Passkeys / WebAuthn — §6.4
    * ---------------------------------------------------------------- */
-  router.post('/webauthn/register/options', requireAuth, (req, res) => {
-    const existing = db.prepare('SELECT credential_id FROM webauthn_credentials WHERE user_id = ?').all(req.user!.id) as { credential_id: string }[];
+  router.post('/webauthn/register/options', requireAuth, async (req, res) => {
+    const existing = await db.all('SELECT credential_id FROM webauthn_credentials WHERE user_id = ?', [req.user!.id]) as { credential_id: string }[];
     const options = registrationOptions({
       rpId: RP_ID,
       rpName: RP_NAME,
@@ -569,7 +534,7 @@ export function authRoutes(db: DB): Router {
     res.json({ flowId, options, rpId: RP_ID, origin: originOf(req) });
   });
 
-  router.post('/webauthn/register/verify', requireAuth, (req, res) => {
+  router.post('/webauthn/register/verify', requireAuth, async (req, res) => {
     const flow = takeFlow(String(req.body?.flowId ?? ''));
     if (!flow || flow.mode !== 'register' || flow.userId !== req.user!.id) {
       return res.status(400).json({ error: 'flow_expired', message: 'Session d’enregistrement expirée.' });
@@ -582,12 +547,10 @@ export function authRoutes(db: DB): Router {
         origin: originOf(req),
         rpId: RP_ID,
       });
-      const exists = db.prepare('SELECT 1 AS hit FROM webauthn_credentials WHERE credential_id = ?').get(result.credentialId);
+      const exists = await db.get('SELECT 1 AS hit FROM webauthn_credentials WHERE credential_id = ?', [result.credentialId]);
       if (exists) return res.status(409).json({ error: 'credential_exists' });
-      db.prepare('INSERT INTO webauthn_credentials (id,user_id,credential_id,public_key,counter,label,created_at) VALUES (?,?,?,?,?,?,?)')
-        .run(newId('pk'), req.user!.id, result.credentialId, JSON.stringify(result.cose), result.counter,
-          String(req.body?.label ?? 'Passkey').slice(0, 60), Date.now());
-      appendAudit(db, {
+      await db.run('INSERT INTO webauthn_credentials (id,user_id,credential_id,public_key,counter,label,created_at) VALUES (?,?,?,?,?,?,?)', [newId('pk'), req.user!.id, result.credentialId, JSON.stringify(result.cose), result.counter, String(req.body?.label ?? 'Passkey').slice(0, 60), Date.now()]);
+      await appendAudit(db, {
         actorId: req.user!.id, actorRole: req.user!.role, action: 'mfa.passkey_added',
         targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc,
       });
@@ -597,17 +560,17 @@ export function authRoutes(db: DB): Router {
     }
   });
 
-  router.delete('/webauthn/credentials/:id', requireAuth, (req, res) => {
-    const creds = db.prepare('SELECT * FROM webauthn_credentials WHERE user_id = ?').all(req.user!.id) as { id: string }[];
+  router.delete('/webauthn/credentials/:id', requireAuth, async (req, res) => {
+    const creds = await db.all('SELECT * FROM webauthn_credentials WHERE user_id = ?', [req.user!.id]) as { id: string }[];
     if (creds.length <= 1 && (req.user!.role === 'admin' || req.user!.webauthn_required)) {
       return res.status(409).json({
         error: 'min_factors',
         message: 'Un administrateur doit conserver au minimum deux facteurs enregistrés.',
       });
     }
-    const info = db.prepare('DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?').run(req.params.id, req.user!.id);
+    const info = await db.run('DELETE FROM webauthn_credentials WHERE id = ? AND user_id = ?', [String(req.params.id), req.user!.id]);
     if (!info.changes) return res.status(404).json({ error: 'not_found' });
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'mfa.passkey_removed',
       targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc,
     });
@@ -616,10 +579,10 @@ export function authRoutes(db: DB): Router {
 
   router.post('/webauthn/login/options', async (req, res) => {
     const identifier = String(req.body?.identifier ?? '').trim();
-    const user = identifier ? findUserByIdentifier(db, identifier) : undefined;
+    const user = identifier ? await findUserByIdentifier(db, identifier) : undefined;
     // Usernameless fallback: empty allowCredentials, discovery by resident key.
     const allow = user
-      ? (db.prepare('SELECT credential_id FROM webauthn_credentials WHERE user_id = ?').all(user.id) as { credential_id: string }[]).map((c) => c.credential_id)
+      ? (await db.all('SELECT credential_id FROM webauthn_credentials WHERE user_id = ?', [user.id]) as { credential_id: string }[]).map((c) => c.credential_id)
       : [];
     const challenge = newChallenge();
     const flowId = putFlow({ challenge, userId: user?.id, mode: 'assert' });
@@ -635,7 +598,7 @@ export function authRoutes(db: DB): Router {
     const flow = takeFlow(String(req.body?.flowId ?? ''));
     if (!flow || flow.mode !== 'assert') return res.status(400).json({ error: 'flow_expired' });
     const credentialId = String(req.body?.id ?? '');
-    const cred = db.prepare('SELECT * FROM webauthn_credentials WHERE credential_id = ?').get(credentialId) as
+    const cred = await db.get('SELECT * FROM webauthn_credentials WHERE credential_id = ?', [credentialId]) as
       | { id: string; user_id: string; credential_id: string; public_key: string; counter: number }
       | undefined;
     if (!cred) return res.status(401).json({ error: 'unknown_credential' });
@@ -651,19 +614,19 @@ export function authRoutes(db: DB): Router {
         cose: JSON.parse(cred.public_key),
         storedCounter: cred.counter,
       });
-      db.prepare('UPDATE webauthn_credentials SET counter = ? WHERE credential_id = ?').run(result.counter, cred.credential_id);
-      const user = findUserById(db, cred.user_id);
+      await db.run('UPDATE webauthn_credentials SET counter = ? WHERE credential_id = ?', [result.counter, cred.credential_id]);
+      const user = await findUserById(db, cred.user_id);
       if (!user || user.status !== 'active') return res.status(403).json({ error: 'account_restricted' });
-      const { token, session } = createSession(db, {
+      const { token, session } = await createSession(db, {
         userId: user.id, role: user.role, ip: clientIp(req), userAgent: req.get('user-agent') ?? '', mfaVerified: true,
       });
       setSessionCookies(res, token, session.csrf_token);
-      db.prepare('UPDATE users SET reauth_at = ? WHERE id = ?').run(Date.now(), user.id);
-      appendAudit(db, {
+      await db.run('UPDATE users SET reauth_at = ? WHERE id = ?', [Date.now(), user.id]);
+      await appendAudit(db, {
         actorId: user.id, actorRole: user.role, action: 'auth.login', targetType: 'session',
         targetId: session.id.slice(0, 12), ipTrunc: req.ipTrunc, meta: { method: 'passkey' },
       });
-      ok(res, { mfaVerified: true, ...sessionPayload(db, user) });
+      ok(res, { mfaVerified: true, ...await sessionPayload(db, user) });
     } catch {
       return res.status(401).json({ error: 'webauthn_failed' });
     }
@@ -680,34 +643,44 @@ export function authRoutes(db: DB): Router {
     }
     // Constant delay + identical response whether the account exists or not.
     await applyLoginDelay([`forgot:${sha256(email.toLowerCase())}`], 150);
-    const user = db.prepare('SELECT * FROM users WHERE lower(email) = lower(?)').get(email) as PublicUser | undefined;
+    const user = await db.get('SELECT * FROM users WHERE lower(email) = lower(?)', [email]) as PublicUser | undefined;
     let token: string | null = null;
     if (user) {
-      db.prepare('UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL').run(Date.now(), user.id);
+      await db.run('UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL', [Date.now(), user.id]);
       token = newToken(32);
       const now = Date.now();
-      db.prepare('INSERT INTO password_reset_tokens (id,user_id,token_hash,created_at,expires_at) VALUES (?,?,?,?,?)')
-        .run(newId('prt'), user.id, sha256(token), now, now + PASSWORD_RESET_TTL_MS);
-      appendAudit(db, {
+      await db.run('INSERT INTO password_reset_tokens (id,user_id,token_hash,created_at,expires_at) VALUES (?,?,?,?,?)', [newId('prt'), user.id, sha256(token), now, now + PASSWORD_RESET_TTL_MS]);
+      await appendAudit(db, {
         actorId: user.id, actorRole: user.role, action: 'auth.reset_requested', targetType: 'user',
         targetId: user.id, ipTrunc: req.ipTrunc,
       });
     }
-    // In production the token is emailed, never returned by the API.
-    res.json({ ok: true, message: GENERIC_RESET, ...(DEMO_MODE && token ? { demoToken: token } : {}) });
+    // Envoi réel du lien par e-mail. Sans transport configuré, aucun jeton
+    // n'est exposé au client : l'information reste côté serveur.
+    if (user?.email && token && isMailConfigured()) {
+      try {
+        await sendPasswordReset(user.email, token);
+      } catch (error) {
+        console.warn('[mail] envoi du lien de réinitialisation échoué :', (error as Error).message);
+      }
+    } else if (user && token) {
+      console.warn('[mail] SMTP non configuré : lien de réinitialisation non envoyé (SMTP_URL manquant).');
+    }
+    // En test d'intégration, le jeton est exposé pour automatiser le flux.
+    res.json({ ok: true, message: GENERIC_RESET, ...(process.env.NODE_ENV === 'test' && token ? { testToken: token } : {}) });
   });
 
   router.post('/password/reset', async (req, res) => {
     const token = String(req.body?.token ?? '');
     const password = String(req.body?.password ?? '');
     if (!token) return res.status(400).json({ error: 'invalid_token', message: 'Lien invalide ou expiré.' });
-    const row = db.prepare('SELECT * FROM password_reset_tokens WHERE token_hash = ?').get(sha256(token)) as
+    const row = await db.get('SELECT * FROM password_reset_tokens WHERE token_hash = ?', [sha256(token)]) as
       | { id: string; user_id: string; expires_at: number; used_at: number | null }
       | undefined;
     if (!row || row.used_at || row.expires_at < Date.now()) {
       return res.status(400).json({ error: 'invalid_token', message: 'Lien invalide ou expiré.' });
     }
-    const user = findUserById(db, row.user_id);
+    const user = await findUserById(db, row.user_id);
     if (!user) return res.status(400).json({ error: 'invalid_token' });
     const policy = await evaluatePassword(password, {
       staff: isStaffRole(user.role),
@@ -719,12 +692,12 @@ export function authRoutes(db: DB): Router {
         message: passwordMessage(policy.issues, policy.minLength),
       });
     }
-    db.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?').run(await hashPassword(password), Date.now(), user.id);
-    db.prepare('UPDATE password_reset_tokens SET used_at = ? WHERE id = ?').run(Date.now(), row.id);
-    db.prepare('UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL').run(Date.now(), user.id);
+    await db.run('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?', [await hashPassword(password), Date.now(), user.id]);
+    await db.run('UPDATE password_reset_tokens SET used_at = ? WHERE id = ?', [Date.now(), row.id]);
+    await db.run('UPDATE password_reset_tokens SET used_at = ? WHERE user_id = ? AND used_at IS NULL', [Date.now(), user.id]);
     // A reset never bypasses 2FA: sessions are dropped and 2FA stays required.
-    const revoked = revokeAllForUser(db, user.id, null, 'password_reset');
-    appendAudit(db, {
+    const revoked = await revokeAllForUser(db, user.id, null, 'password_reset');
+    await appendAudit(db, {
       actorId: user.id, actorRole: user.role, action: 'auth.password_reset', targetType: 'user',
       targetId: user.id, ipTrunc: req.ipTrunc, meta: { revokedSessions: revoked },
     });
@@ -753,10 +726,9 @@ export function authRoutes(db: DB): Router {
         message: passwordMessage(policy.issues, policy.minLength),
       });
     }
-    db.prepare('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?')
-      .run(await hashPassword(next), Date.now(), req.user!.id);
-    const revoked = revokeAllForUser(db, req.user!.id, req.session?.id ?? null, 'password_changed');
-    appendAudit(db, {
+    await db.run('UPDATE users SET password_hash = ?, updated_at = ? WHERE id = ?', [await hashPassword(next), Date.now(), req.user!.id]);
+    const revoked = await revokeAllForUser(db, req.user!.id, req.session?.id ?? null, 'password_changed');
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'auth.password_changed',
       targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc, meta: { revokedSessions: revoked },
     });
@@ -766,51 +738,29 @@ export function authRoutes(db: DB): Router {
   /* ---------------------------------------------------------------- *
    * OAuth2 / OIDC PKCE — §5.1, §6.6
    * ---------------------------------------------------------------- */
-  const PROVIDERS = ['discord', 'steam', 'epic', 'google'] as const;
-  type Provider = (typeof PROVIDERS)[number];
-
-  function providerConfig(provider: Provider) {
-    const id = process.env[`OAUTH_${provider.toUpperCase()}_CLIENT_ID`];
-    const authorize = process.env[`OAUTH_${provider.toUpperCase()}_AUTHORIZE_URL`];
-    return { clientId: id, authorize };
-  }
-
   router.get('/oauth/:provider/start', (req, res) => {
-    const provider = req.params.provider as Provider;
-    if (!PROVIDERS.includes(provider)) return res.status(404).json({ error: 'unknown_provider' });
+    const provider = req.params.provider as OAuthProvider;
+    if (!OAUTH_PROVIDERS.includes(provider)) return res.status(404).json({ error: 'unknown_provider' });
     const nonce = newToken(16);
     const verifier = newToken(32);
     const challenge = createHash('sha256').update(verifier).digest('base64url');
     const link = req.query.link === '1' && !!req.user;
     const state = putFlow({ challenge, provider, nonce, verifier, mode: link ? 'link' : 'oauth' });
     const redirectUri = `${originOf(req)}/api/auth/oauth/${provider}/callback`;
-    const config = providerConfig(provider);
-    if (config.authorize && config.clientId) {
-      const url = new URL(config.authorize);
-      url.searchParams.set('client_id', config.clientId);
-      url.searchParams.set('redirect_uri', redirectUri);
-      url.searchParams.set('response_type', 'code');
-      url.searchParams.set('scope', 'openid email profile');
-      url.searchParams.set('state', state);
-      url.searchParams.set('nonce', nonce);
-      url.searchParams.set('code_challenge', challenge);
-      url.searchParams.set('code_challenge_method', 'S256');
-      return res.json({ url: url.toString(), state, link });
-    }
-    // No provider credentials configured: the flow uses the local mock consent
-    // screen so PKCE, state and nonce validation are exercised end-to-end.
-    res.json({
-      url: `/oauth/mock?provider=${provider}&state=${state}&redirect_uri=${encodeURIComponent(redirectUri)}`,
-      state,
-      link,
-      mock: true,
-      note: 'Aucun identifiant OAuth configuré : écran de consentement local de démonstration.',
+    const url = authorizeUrl(provider, { redirectUri, state, nonce, codeChallenge: challenge });
+    if (url) return res.json({ url, state, link });
+    // Fournisseur sans identifiants : le bouton reste inactif côté interface et
+    // l'API répond explicitement (aucune redirection vers un écran inexistant).
+    const { missing } = providerConfig(provider);
+    return res.status(503).json({
+      error: 'provider_not_configured',
+      message: `Fournisseur ${provider} non configuré : renseignez ${missing.join(', ')}.`,
     });
   });
 
   router.get('/oauth/:provider/callback', async (req, res) => {
-    const provider = req.params.provider as Provider;
-    if (!PROVIDERS.includes(provider)) return res.status(404).json({ error: 'unknown_provider' });
+    const provider = req.params.provider as OAuthProvider;
+    if (!OAUTH_PROVIDERS.includes(provider)) return res.status(404).json({ error: 'unknown_provider' });
     const state = String(req.query.state ?? '');
     const code = String(req.query.code ?? '');
     const flow = takeFlow(state);
@@ -818,27 +768,42 @@ export function authRoutes(db: DB): Router {
       return res.status(400).send(oauthResultPage('Requête invalide', 'Le paramètre state est invalide ou expiré.'));
     }
     if (!code) return res.status(400).send(oauthResultPage('Requête invalide', 'Code d’autorisation manquant.'));
+    if (!flow.verifier) return res.status(400).send(oauthResultPage('Requête invalide', 'Vérificateur PKCE absent.'));
 
-    // Token exchange happens server-side with the PKCE verifier.
-    const subject = `ext_${createHash('sha256').update(`${provider}:${code}:${flow.verifier}`).digest('hex').slice(0, 40)}`;
-    const identity = db.prepare('SELECT * FROM oauth_identities WHERE provider = ? AND subject = ?').get(provider, subject) as
+    // Échange serveur-à-serveur du code (PKCE), puis lecture de l'identité.
+    // Le contenu de l'URL de retour n'est jamais utilisé comme preuve.
+    let subject: string;
+    try {
+      const exchanged = await exchangeOAuthCode(provider, {
+        code,
+        redirectUri: `${originOf(req)}/api/auth/oauth/${provider}/callback`,
+        verifier: flow.verifier,
+      });
+      subject = exchanged.subject;
+    } catch (error) {
+      const status = error instanceof OAuthError ? Math.max(400, error.status) : 502;
+      return res.status(status).send(oauthResultPage('Connexion externe impossible', (error as Error).message));
+    }
+
+    const identity = await db.get('SELECT * FROM oauth_identities WHERE provider = ? AND subject = ?', [provider, subject]) as
       | { user_id: string }
       | undefined;
 
     if (flow.mode === 'link') {
       const cookie = readCookie(req, SESSION_COOKIE);
-      const session = cookie ? (db.prepare('SELECT * FROM sessions WHERE id = ? AND revoked_at IS NULL').get(sha256(cookie)) as any) : null;
+      const session = cookie ? (await db.get('SELECT * FROM sessions WHERE id = ? AND revoked_at IS NULL', [sha256(cookie)]) as any) : null;
       if (!session) return res.status(401).send(oauthResultPage('Non authentifié', 'Connectez-vous puis relancez la liaison.'));
-      const user = findUserById(db, session.user_id);
+      const user = await findUserById(db, session.user_id);
       if (!user || Date.now() - (user.reauth_at ?? 0) > 5 * 60 * 1000) {
         return res.status(403).send(oauthResultPage('Réauthentification requise', 'La liaison exige une réauthentification de moins de 5 minutes.'));
       }
       if (isStaffRole(user.role)) {
         return res.status(403).send(oauthResultPage('Non autorisé', 'Le personnel ne peut pas lier de fournisseur externe.'));
       }
-      db.prepare('INSERT OR REPLACE INTO oauth_identities (id,user_id,provider,subject,linked_at) VALUES (?,?,?,?,?)')
-        .run(newId('oid'), user.id, provider, subject, Date.now());
-      appendAudit(db, {
+      await db.upsert('oauth_identities', {
+        id: newId('oid'), user_id: user.id, provider, subject, linked_at: Date.now(),
+      }, ['provider', 'subject']);
+      await appendAudit(db, {
         actorId: user.id, actorRole: user.role, action: 'oauth.linked', targetType: 'user',
         targetId: user.id, ipTrunc: req.ipTrunc, meta: { provider },
       });
@@ -846,7 +811,7 @@ export function authRoutes(db: DB): Router {
     }
 
     if (identity) {
-      const user = findUserById(db, identity.user_id);
+      const user = await findUserById(db, identity.user_id);
       if (!user) return res.status(400).send(oauthResultPage('Compte introuvable', ''));
       if (isStaffRole(user.role)) {
         return res.status(403).send(oauthResultPage(
@@ -857,12 +822,12 @@ export function authRoutes(db: DB): Router {
       if (user.status !== 'active') {
         return res.status(403).send(oauthResultPage('Connexion refusée', 'Ce compte est restreint.'));
       }
-      const { token, session } = createSession(db, {
+      const { token, session } = await createSession(db, {
         userId: user.id, role: user.role, ip: clientIp(req), userAgent: req.get('user-agent') ?? '', mfaVerified: !user.totp_secret,
       });
       res.cookie(SESSION_COOKIE, token, { httpOnly: true, secure: IS_PROD, sameSite: 'lax', path: COOKIE_PATH });
       res.cookie(CSRF_COOKIE, session.csrf_token, { httpOnly: false, secure: IS_PROD, sameSite: 'lax', path: COOKIE_PATH });
-      appendAudit(db, {
+      await appendAudit(db, {
         actorId: user.id, actorRole: user.role, action: 'auth.login', targetType: 'session',
         targetId: session.id.slice(0, 12), ipTrunc: req.ipTrunc, meta: { method: `oauth:${provider}` },
       });
@@ -873,22 +838,20 @@ export function authRoutes(db: DB): Router {
     const now = Date.now();
     const suffix = randomBytes(3).toString('hex');
     let username = `${provider}_${suffix}`;
-    while (db.prepare('SELECT 1 AS hit FROM users WHERE lower(username) = lower(?)').get(username)) {
+    while (await db.get('SELECT 1 AS hit FROM users WHERE lower(username) = lower(?)', [username])) {
       username = `${provider}_${randomBytes(3).toString('hex')}`;
     }
     const id = newId('usr');
-    const mirageId = mirageIdFor(db, now);
-    db.prepare(`INSERT INTO users
+    const mirageId = await mirageIdFor(db, now);
+    await db.run(`INSERT INTO users
       (id,mirage_id,username,email,password_hash,role,status,email_verified,locale,profile_public,show_socials,socials_json,bio,created_at,updated_at)
-      VALUES (?,?,?,NULL,NULL,'player','active',0,'fr',0,0,'{}','',?,?)`)
-      .run(id, mirageId, username, now, now);
-    db.prepare('INSERT INTO oauth_identities (id,user_id,provider,subject,linked_at) VALUES (?,?,?,?,?)')
-      .run(newId('oid'), id, provider, subject, now);
-    appendAudit(db, {
+      VALUES (?,?,?,NULL,NULL,'player','active',0,'fr',0,0,'{}','',?,?)`, [id, mirageId, username, now, now]);
+    await db.run('INSERT INTO oauth_identities (id,user_id,provider,subject,linked_at) VALUES (?,?,?,?,?)', [newId('oid'), id, provider, subject, now]);
+    await appendAudit(db, {
       actorId: id, actorRole: 'player', action: 'account.created', targetType: 'user', targetId: id,
       ipTrunc: req.ipTrunc, meta: { provider, via: 'oauth', needsEmail: true },
     });
-    const { token, session } = createSession(db, { userId: id, role: 'player', ip: clientIp(req), userAgent: req.get('user-agent') ?? '', mfaVerified: true });
+    const { token, session } = await createSession(db, { userId: id, role: 'player', ip: clientIp(req), userAgent: req.get('user-agent') ?? '', mfaVerified: true });
     res.cookie(SESSION_COOKIE, token, { httpOnly: true, secure: IS_PROD, sameSite: 'lax', path: COOKIE_PATH });
     res.cookie(CSRF_COOKIE, session.csrf_token, { httpOnly: false, secure: IS_PROD, sameSite: 'lax', path: COOKIE_PATH });
     // Steam accounts created on first launch have no email: the player is prompted to add one.
@@ -902,19 +865,18 @@ export function authRoutes(db: DB): Router {
     const email = String(req.body?.email ?? '').trim();
     const password = String(req.body?.password ?? '');
     if (!EMAIL_RE.test(email)) return res.status(400).json({ error: 'invalid_email', message: 'Adresse électronique invalide.' });
-    const conflict = db.prepare('SELECT 1 AS hit FROM users WHERE lower(email) = lower(?) AND id <> ?').get(email, req.user!.id);
+    const conflict = await db.get('SELECT 1 AS hit FROM users WHERE lower(email) = lower(?) AND id <> ?', [email, req.user!.id]);
     if (conflict) return res.status(409).json({ error: 'email_taken', message: 'Cette adresse est déjà associée à un autre compte.' });
     if (!req.user!.password_hash && password.length > 0) {
       const policy = await evaluatePassword(password, { staff: false, identifiers: [req.user!.username, email] });
       if (!policy.ok) {
         return res.status(400).json({ error: 'password_policy', issues: policy.issues, message: passwordMessage(policy.issues, policy.minLength) });
       }
-      db.prepare('UPDATE users SET email = ?, password_hash = ?, updated_at = ? WHERE id = ?')
-        .run(email, await hashPassword(password), Date.now(), req.user!.id);
+      await db.run('UPDATE users SET email = ?, password_hash = ?, updated_at = ? WHERE id = ?', [email, await hashPassword(password), Date.now(), req.user!.id]);
     } else {
-      db.prepare('UPDATE users SET email = ?, updated_at = ? WHERE id = ?').run(email, Date.now(), req.user!.id);
+      await db.run('UPDATE users SET email = ?, updated_at = ? WHERE id = ?', [email, Date.now(), req.user!.id]);
     }
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'account.email_set',
       targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc,
     });
@@ -935,14 +897,14 @@ function passwordMessage(issues: string[], minLength: number): string {
 }
 
 async function consumeBackupCode(db: DB, userId: string, code: string): Promise<boolean> {
-  const rows = db.prepare('SELECT id, code_hash FROM backup_codes WHERE user_id = ? AND used_at IS NULL').all(userId) as
+  const rows = await db.all('SELECT id, code_hash FROM backup_codes WHERE user_id = ? AND used_at IS NULL', [userId]) as
     { id: string; code_hash: string }[];
   const normalised = code.replace(/\s|-/g, '').toUpperCase();
   for (const row of rows) {
     if (await argon2.verify(row.code_hash, normalised).catch(() => false)) {
-      db.prepare('UPDATE backup_codes SET used_at = ? WHERE id = ?').run(Date.now(), row.id);
-      const left = db.prepare('SELECT COUNT(*) AS c FROM backup_codes WHERE user_id = ? AND used_at IS NULL').get(userId) as { c: number };
-      db.prepare('UPDATE users SET backup_codes_left = ? WHERE id = ?').run(left.c, userId);
+      await db.run('UPDATE backup_codes SET used_at = ? WHERE id = ?', [Date.now(), row.id]);
+      const left = await db.get('SELECT COUNT(*) AS c FROM backup_codes WHERE user_id = ? AND used_at IS NULL', [userId]) as { c: number };
+      await db.run('UPDATE users SET backup_codes_left = ? WHERE id = ?', [left.c, userId]);
       return true;
     }
   }
@@ -950,16 +912,15 @@ async function consumeBackupCode(db: DB, userId: string, code: string): Promise<
 }
 
 async function regenerateBackupCodes(db: DB, userId: string, currentSessionId: string | null): Promise<string[]> {
-  db.prepare('DELETE FROM backup_codes WHERE user_id = ?').run(userId);
+  await db.run('DELETE FROM backup_codes WHERE user_id = ?', [userId]);
   const codes: string[] = [];
   for (let i = 0; i < 10; i++) {
     const raw = randomBytes(5).toString('hex').toUpperCase();
     const formatted = `${raw.slice(0, 5)}-${raw.slice(5, 10)}`;
     codes.push(formatted);
-    db.prepare('INSERT INTO backup_codes (id,user_id,code_hash,created_at) VALUES (?,?,?,?)')
-      .run(newId('bck'), userId, await argon2.hash(formatted.replace('-', ''), { type: argon2.argon2id, memoryCost: 8192, timeCost: 1, parallelism: 1 }), Date.now());
+    await db.run('INSERT INTO backup_codes (id,user_id,code_hash,created_at) VALUES (?,?,?,?)', [newId('bck'), userId, await argon2.hash(formatted.replace('-', ''), { type: argon2.argon2id, memoryCost: 8192, timeCost: 1, parallelism: 1 }), Date.now()]);
   }
-  db.prepare('UPDATE users SET backup_codes_left = 10 WHERE id = ?').run(userId);
+  await db.run('UPDATE users SET backup_codes_left = 10 WHERE id = ?', [userId]);
   void currentSessionId;
   return codes;
 }

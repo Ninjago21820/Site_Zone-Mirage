@@ -3,7 +3,7 @@ import cookieParser from 'cookie-parser';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { DB } from './db.js';
-import { openDb, seed } from './db.js';
+import { openDb } from './db.js';
 import {
   HOST, IS_PROD, PORT, ADMIN_PATH, DATA_DIR, DELETION_GRACE_MS,
 } from './config.js';
@@ -111,26 +111,24 @@ export async function createApp(db: DB, options: AppOptions = {}): Promise<Expre
 }
 
 /** Housekeeping: account purge after the 7-day window, audit retention. */
-function startHousekeeping(db: DB) {
-  const run = () => {
+async function startHousekeeping(db: DB) {
+  const run = async () => {
     try {
-      purgeAudit(db);
+      await purgeAudit(db);
       const now = Date.now();
-      const expired = db.prepare(
-        "SELECT id FROM users WHERE status = 'pending_deletion' AND purge_after IS NOT NULL AND purge_after < ?",
-      ).all(now) as { id: string }[];
+      const expired = await db.all("SELECT id FROM users WHERE status = 'pending_deletion' AND purge_after IS NOT NULL AND purge_after < ?", [now]) as { id: string }[];
       for (const user of expired) {
-        revokeAllForUser(db, user.id, null, 'account_purged');
+        await revokeAllForUser(db, user.id, null, 'account_purged');
         // The Mirage ID row in reserved_mirage_ids is intentionally kept forever.
-        db.prepare('DELETE FROM users WHERE id = ?').run(user.id);
+        await db.run('DELETE FROM users WHERE id = ?', [user.id]);
       }
-      db.prepare('DELETE FROM login_attempts WHERE at < ?').run(now - 30 * 86400000);
-      db.prepare('DELETE FROM sessions WHERE absolute_expires_at < ?').run(now - 7 * 86400000);
+      await db.run('DELETE FROM login_attempts WHERE at < ?', [now - 30 * 86400000]);
+      await db.run('DELETE FROM sessions WHERE absolute_expires_at < ?', [now - 7 * 86400000]);
     } catch (error) {
       console.error('[housekeeping]', (error as Error).message);
     }
   };
-  run();
+  await run();
   const timer = setInterval(run, 60 * 60 * 1000);
   timer.unref();
   void DELETION_GRACE_MS;
@@ -140,17 +138,16 @@ function startHousekeeping(db: DB) {
 const isDirectRun = process.argv[1] && /server[\\/]index\.(ts|js)$/.test(process.argv[1]);
 
 if (isDirectRun) {
-  const db = openDb();
-  await seed(db);
-  ensureSigningKey(db);
-  startHousekeeping(db);
+  const db = await openDb();
+  await ensureSigningKey(db);
+  await startHousekeeping(db);
   const app = await createApp(db, { frontend: IS_PROD ? 'static' : 'vite' });
-  app.listen(PORT, HOST, () => {
+  app.listen(PORT, HOST, async () => {
     console.log(`\n  SCP: Mirage Protocol — serveur démarré`);
     console.log(`  → http://${HOST}:${PORT}`);
     console.log(`  → Back-office : ${ADMIN_PATH}`);
     console.log(`  → Environnement : ${IS_PROD ? 'production' : 'développement'}`);
-    console.log(`  → Journal d'audit : ${(db.prepare('SELECT COUNT(*) AS c FROM audit_log').get() as { c: number }).c} entrées\n`);
+    console.log(`  → Journal d'audit : ${(await db.get('SELECT COUNT(*) AS c FROM audit_log') as { c: number }).c} entrées\n`);
     void clientIp;
   });
 }

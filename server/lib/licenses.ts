@@ -14,9 +14,8 @@ export interface SigningKey {
   algorithm: string;
 }
 
-export function ensureSigningKey(db: DB): SigningKey {
-  const existing = db.prepare("SELECT * FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at DESC LIMIT 1")
-    .get() as SigningKey | undefined;
+export async function ensureSigningKey(db: DB): Promise<SigningKey> {
+  const existing = await db.get("SELECT * FROM api_keys WHERE revoked_at IS NULL ORDER BY created_at DESC LIMIT 1") as SigningKey | undefined;
   if (existing) return existing;
   const { publicKey, privateKey } = generateKeyPairSync('ed25519');
   const kid = `zm-${new Date().toISOString().slice(0, 7).replace('-', '')}-${randomBytes(3).toString('hex')}`;
@@ -26,13 +25,12 @@ export function ensureSigningKey(db: DB): SigningKey {
     privateKey: privateKey.export({ type: 'pkcs8', format: 'pem' }).toString(),
     algorithm: 'Ed25519',
   };
-  db.prepare('INSERT INTO api_keys (kid,algorithm,public_key,private_key,created_at) VALUES (?,?,?,?,?)')
-    .run(row.kid, row.algorithm, row.publicKey, row.privateKey, Date.now());
+  await db.run('INSERT INTO api_keys (kid,algorithm,public_key,private_key,created_at) VALUES (?,?,?,?,?)', [row.kid, row.algorithm, row.publicKey, row.privateKey, Date.now()]);
   return row;
 }
 
-export function publicSigningKeys(db: DB) {
-  return (db.prepare('SELECT kid,algorithm,public_key,created_at,revoked_at FROM api_keys ORDER BY created_at DESC').all() as {
+export async function publicSigningKeys(db: DB) {
+  return (await db.all('SELECT kid,algorithm,public_key,created_at,revoked_at FROM api_keys ORDER BY created_at DESC') as {
     kid: string; algorithm: string; public_key: string; created_at: number; revoked_at: number | null;
   }[]).map((k) => ({
     kid: k.kid,
@@ -57,8 +55,8 @@ export interface LicenseClaims {
   jti?: string;
 }
 
-export function signLicenseToken(db: DB, claims: Omit<LicenseClaims, 'kid'>): { token: string; claims: LicenseClaims } {
-  const key = ensureSigningKey(db);
+export async function signLicenseToken(db: DB, claims: Omit<LicenseClaims, 'kid'>): Promise<{ token: string; claims: LicenseClaims }> {
+  const key = await ensureSigningKey(db);
   const full: LicenseClaims = { ...claims, kid: key.kid, jti: claims.jti ?? randomBytes(9).toString('base64url') };
   const header = Buffer.from(JSON.stringify({ alg: 'EdDSA', typ: 'JWT', kid: key.kid })).toString('base64url');
   const payload = Buffer.from(JSON.stringify(full)).toString('base64url');
@@ -66,7 +64,7 @@ export function signLicenseToken(db: DB, claims: Omit<LicenseClaims, 'kid'>): { 
   return { token: `${header}.${payload}.${signature}`, claims: full };
 }
 
-export function verifyLicenseToken(db: DB, token: string): { valid: boolean; claims?: LicenseClaims; reason?: string } {
+export async function verifyLicenseToken(db: DB, token: string): Promise<{ valid: boolean; claims?: LicenseClaims; reason?: string }> {
   const parts = String(token ?? '').split('.');
   if (parts.length !== 3) return { valid: false, reason: 'malformed' };
   const [header, payload, signature] = parts;
@@ -78,7 +76,7 @@ export function verifyLicenseToken(db: DB, token: string): { valid: boolean; cla
   } catch {
     return { valid: false, reason: 'malformed' };
   }
-  const row = db.prepare('SELECT public_key, revoked_at FROM api_keys WHERE kid = ?').get(parsedHeader.kid) as
+  const row = await db.get('SELECT public_key, revoked_at FROM api_keys WHERE kid = ?', [String(parsedHeader.kid ?? '')]) as
     | { public_key: string; revoked_at: number | null }
     | undefined;
   if (!row || row.revoked_at) return { valid: false, reason: 'unknown_kid' };
@@ -89,23 +87,22 @@ export function verifyLicenseToken(db: DB, token: string): { valid: boolean; cla
 }
 
 /** §5.5 — single-use, short-lived, server-bound session ticket. */
-export function issueSessionTicket(db: DB, userId: string, serverId: string, ttlMs = 60_000) {
+export async function issueSessionTicket(db: DB, userId: string, serverId: string, ttlMs = 60_000) {
   const jti = randomBytes(24).toString('base64url');
   const now = Date.now();
-  db.prepare('INSERT INTO game_session_tickets (jti,user_id,server_id,issued_at,expires_at) VALUES (?,?,?,?,?)')
-    .run(jti, userId, serverId, now, now + ttlMs);
+  await db.run('INSERT INTO game_session_tickets (jti,user_id,server_id,issued_at,expires_at) VALUES (?,?,?,?,?)', [jti, userId, serverId, now, now + ttlMs]);
   return { ticket: jti, expiresAt: now + ttlMs, serverId };
 }
 
-export function consumeSessionTicket(db: DB, jti: string, serverId: string) {
-  const row = db.prepare('SELECT * FROM game_session_tickets WHERE jti = ?').get(jti) as
+export async function consumeSessionTicket(db: DB, jti: string, serverId: string) {
+  const row = await db.get('SELECT * FROM game_session_tickets WHERE jti = ?', [jti]) as
     | { jti: string; user_id: string; server_id: string; expires_at: number; used_at: number | null }
     | undefined;
   if (!row) return { ok: false as const, reason: 'unknown_ticket' };
   if (row.server_id !== serverId) return { ok: false as const, reason: 'wrong_server' };
   if (row.used_at) return { ok: false as const, reason: 'already_used' };
   if (row.expires_at < Date.now()) return { ok: false as const, reason: 'expired' };
-  db.prepare('UPDATE game_session_tickets SET used_at = ? WHERE jti = ?').run(Date.now(), jti);
+  await db.run('UPDATE game_session_tickets SET used_at = ? WHERE jti = ?', [Date.now(), jti]);
   return { ok: true as const, userId: row.user_id };
 }
 

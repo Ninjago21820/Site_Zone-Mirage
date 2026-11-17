@@ -1,6 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import mysql, { type Pool, type PoolConnection, type ResultSetHeader, type RowDataPacket } from 'mysql2/promise';
-import { buildInsert, normaliseParams, type DB, type Param, type Row, type RunResult } from './types.js';
+import { bind, buildInsert, normaliseParams, type DB, type Param, type Params, type Row, type RunResult } from './types.js';
 import { upsertSql, insertIgnoreSql } from './dialect.js';
 
 export interface MysqlOptions {
@@ -36,7 +36,7 @@ export function createMysqlDb(options: MysqlOptions): DB {
         user: options.user,
         password: options.password,
         database: options.database,
-        ssl: options.ssl,
+        ssl: options.ssl as never,
         waitForConnections: true,
         connectionLimit,
         timezone: 'Z',
@@ -45,26 +45,27 @@ export function createMysqlDb(options: MysqlOptions): DB {
 
   const binding = new AsyncLocalStorage<PoolConnection>();
 
-  async function query<T>(sql: string, params: Param[] = []): Promise<T> {
+  async function query<T>(sql: string, params: Params = []): Promise<T> {
+    const bound = bind(sql, params);
     const connection = binding.getStore();
     const executor = connection ?? pool;
-    const [result] = await executor.query(sql, normaliseParams(params));
+    const [result] = await executor.query(bound.sql, bound.values);
     return result as T;
   }
 
   const db: DB = {
     dialect: 'mysql',
 
-    async get<T = Row>(sql: string, params: Param[] = []): Promise<T | undefined> {
+    async get<T = Row>(sql: string, params: Params = []): Promise<T | undefined> {
       const rows = await query<RowDataPacket[]>(sql, params);
       return (rows[0] as T | undefined) ?? undefined;
     },
 
-    async all<T = Row>(sql: string, params: Param[] = []): Promise<T[]> {
+    async all<T = Row>(sql: string, params: Params = []): Promise<T[]> {
       return (await query<RowDataPacket[]>(sql, params)) as unknown as T[];
     },
 
-    async run(sql: string, params: Param[] = []): Promise<RunResult> {
+    async run(sql: string, params: Params = []): Promise<RunResult> {
       const result = await query<ResultSetHeader>(sql, params);
       return {
         lastInsertRowid: Number((result as ResultSetHeader)?.insertId ?? 0),

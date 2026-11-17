@@ -17,14 +17,12 @@ export function accountRoutes(db: DB): Router {
   const router = Router();
   router.use(requireAuth);
 
-  router.get('/', (req, res) => {
+  router.get('/', async (req, res) => {
     const user = req.user!;
-    const passkeys = db.prepare('SELECT id, label, created_at FROM webauthn_credentials WHERE user_id = ? ORDER BY created_at DESC')
-      .all(user.id) as { id: string; label: string; created_at: number }[];
-    const backup = db.prepare('SELECT COUNT(*) AS c FROM backup_codes WHERE user_id = ? AND used_at IS NULL').get(user.id) as { c: number };
-    const oauth = db.prepare('SELECT provider, linked_at FROM oauth_identities WHERE user_id = ?').all(user.id) as { provider: string; linked_at: number }[];
-    const activeSessions = db.prepare('SELECT COUNT(*) AS c FROM sessions WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?')
-      .get(user.id, Date.now()) as { c: number };
+    const passkeys = await db.all('SELECT id, label, created_at FROM webauthn_credentials WHERE user_id = ? ORDER BY created_at DESC', [user.id]) as { id: string; label: string; created_at: number }[];
+    const backup = await db.get('SELECT COUNT(*) AS c FROM backup_codes WHERE user_id = ? AND used_at IS NULL', [user.id]) as { c: number };
+    const oauth = await db.all('SELECT provider, linked_at FROM oauth_identities WHERE user_id = ?', [user.id]) as { provider: string; linked_at: number }[];
+    const activeSessions = await db.get('SELECT COUNT(*) AS c FROM sessions WHERE user_id = ? AND revoked_at IS NULL AND expires_at > ?', [user.id, Date.now()]) as { c: number };
     const pendingDeletion = (user as unknown as { deletion_requested_at?: number | null }).deletion_requested_at ?? null;
     const hasPasskey = passkeys.length > 0;
     const licenses = oauth.filter((o) => ['steam', 'epic'].includes(o.provider)).map((o) => ({
@@ -36,7 +34,7 @@ export function accountRoutes(db: DB): Router {
     }));
 
     res.json({
-      profile: profileView(db, user, user.id),
+      profile: await profileView(db, user, user.id),
       email: user.email,
       needsEmail: !user.email,
       locale: user.locale,
@@ -51,20 +49,18 @@ export function accountRoutes(db: DB): Router {
         staffMandatory: user.role !== 'player',
         backupCodesLeft: backup.c,
         recoveryDelayHours: 72,
-        recoveryAvailableAt: (db.prepare("SELECT created_at FROM notifications WHERE user_id = ? AND kind = '2fa_recovery' ORDER BY created_at DESC LIMIT 1")
-          .get(user.id) as { created_at: number } | undefined)?.created_at ?? null,
+        recoveryAvailableAt: (await db.get("SELECT created_at FROM notifications WHERE user_id = ? AND kind = '2fa_recovery' ORDER BY created_at DESC LIMIT 1", [user.id]) as { created_at: number } | undefined)?.created_at ?? null,
       },
       sessions: { active: activeSessions, staffPolicy: user.role !== 'player' },
       licenses,
-      stats: statsSummary(db, user.id),
+      stats: await statsSummary(db, user.id),
       pendingDeletion: pendingDeletion ? { requestedAt: pendingDeletion, purgeAfter: pendingDeletion + DELETION_GRACE_MS } : null,
       reauthFresh: Date.now() - (user.reauth_at ?? 0) < 5 * 60 * 1000,
-      notifications: db.prepare('SELECT id, kind, body, read_at, created_at FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 20')
-        .all(user.id),
+      notifications: await db.all('SELECT id, kind, body, read_at, created_at FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 20', [user.id]),
     });
   });
 
-  router.patch('/profile', (req, res) => {
+  router.patch('/profile', async (req, res) => {
     const user = req.user!;
     const body = req.body ?? {};
     const updates: Record<string, unknown> = {};
@@ -74,7 +70,7 @@ export function accountRoutes(db: DB): Router {
       if (!USERNAME_RE.test(username)) {
         return res.status(400).json({ error: 'invalid_username', message: '3 à 20 caractères : lettres, chiffres, tiret, tiret bas.' });
       }
-      const conflict = db.prepare('SELECT 1 AS hit FROM users WHERE lower(username) = lower(?) AND id <> ?').get(username, user.id);
+      const conflict = await db.get('SELECT 1 AS hit FROM users WHERE lower(username) = lower(?) AND id <> ?', [username, user.id]);
       if (conflict) return res.status(409).json({ error: 'username_taken', message: 'Ce pseudonyme est déjà utilisé.' });
       updates.username = username;
     }
@@ -101,22 +97,21 @@ export function accountRoutes(db: DB): Router {
     if (!Object.keys(updates).length) return res.status(400).json({ error: 'no_changes' });
 
     const fields = Object.keys(updates).map((k) => `${k} = @${k}`).join(', ');
-    db.prepare(`UPDATE users SET ${fields}, updated_at = @updated_at WHERE id = @id`)
-      .run({ ...updates, updated_at: Date.now(), id: user.id });
+    await db.run(`UPDATE users SET ${fields}, updated_at = @updated_at WHERE id = @id`, [{ ...updates, updated_at: Date.now(), id: user.id }]);
 
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: user.id, actorRole: user.role, action: 'account.profile_updated',
       targetType: 'user', targetId: user.id, ipTrunc: req.ipTrunc,
       meta: { fields: Object.keys(updates) },
     });
-    const updated = findUserById(db, user.id)!;
-    res.json({ ok: true, profile: profileView(db, updated, user.id) });
+    const updated = (await findUserById(db, user.id))!;
+    res.json({ ok: true, profile: await profileView(db, updated, user.id) });
   });
 
-  router.get('/stats', (req, res) => {
+  router.get('/stats', async (req, res) => {
     res.json({
-      summary: statsSummary(db, req.user!.id),
-      rows: statsFor(db, req.user!.id).map((s) => ({
+      summary: await statsSummary(db, req.user!.id),
+      rows: (await statsFor(db, req.user!.id)).map((s) => ({
         mode: s.mode,
         operation: s.operation_code,
         ending: s.ending_code,
@@ -137,9 +132,8 @@ export function accountRoutes(db: DB): Router {
     });
   });
 
-  router.get('/licenses', (req, res) => {
-    const rows = db.prepare("SELECT provider, linked_at FROM oauth_identities WHERE user_id = ? AND provider IN ('steam','epic')")
-      .all(req.user!.id) as { provider: string; linked_at: number }[];
+  router.get('/licenses', async (req, res) => {
+    const rows = await db.all("SELECT provider, linked_at FROM oauth_identities WHERE user_id = ? AND provider IN ('steam','epic')", [req.user!.id]) as { provider: string; linked_at: number }[];
     res.json({
       licenses: rows.map((r) => ({
         provider: r.provider,
@@ -152,29 +146,28 @@ export function accountRoutes(db: DB): Router {
     });
   });
 
-  router.get('/notifications', (req, res) => {
+  router.get('/notifications', async (req, res) => {
     res.json({
-      items: db.prepare('SELECT id, kind, body, read_at, created_at FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50')
-        .all(req.user!.id),
+      items: await db.all('SELECT id, kind, body, read_at, created_at FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50', [req.user!.id]),
     });
   });
 
-  router.post('/notifications/read', (req, res) => {
+  router.post('/notifications/read', async (req, res) => {
     if (req.body?.id) {
-      db.prepare('UPDATE notifications SET read_at = ? WHERE id = ? AND user_id = ?').run(Date.now(), String(req.body.id), req.user!.id);
+      await db.run('UPDATE notifications SET read_at = ? WHERE id = ? AND user_id = ?', [Date.now(), String(req.body.id), req.user!.id]);
     } else {
-      db.prepare('UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL').run(Date.now(), req.user!.id);
+      await db.run('UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL', [Date.now(), req.user!.id]);
     }
     res.json({ ok: true });
   });
 
   /** Unlinking an external provider is a sensitive action. */
-  router.post('/oauth/:provider/unlink', requireReauth, (req, res) => {
+  router.post('/oauth/:provider/unlink', requireReauth, async (req, res) => {
     const provider = String(req.params.provider);
     if (!['discord', 'steam', 'epic', 'google'].includes(provider)) return res.status(404).json({ error: 'not_found' });
-    const info = db.prepare('DELETE FROM oauth_identities WHERE user_id = ? AND provider = ?').run(req.user!.id, provider);
+    const info = await db.run('DELETE FROM oauth_identities WHERE user_id = ? AND provider = ?', [req.user!.id, provider]);
     if (!info.changes) return res.status(404).json({ error: 'not_linked' });
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'oauth.unlinked',
       targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc, meta: { provider },
     });
@@ -182,7 +175,7 @@ export function accountRoutes(db: DB): Router {
   });
 
   /** RGPD export (§5.9 / legal). */
-  router.get('/export', (req, res) => {
+  router.get('/export', async (req, res) => {
     const user = req.user!;
     const payload = {
       exportedAt: new Date().toISOString(),
@@ -197,14 +190,14 @@ export function accountRoutes(db: DB): Router {
         socials: socialsOf(user),
         bio: user.bio,
       },
-      stats: statsFor(db, user.id),
-      sessions: db.prepare('SELECT created_at, last_seen, expires_at, ip_trunc, device_label FROM sessions WHERE user_id = ?').all(user.id),
-      oauth: db.prepare('SELECT provider, linked_at FROM oauth_identities WHERE user_id = ?').all(user.id),
-      servers: db.prepare('SELECT name, host, port, status FROM servers WHERE owner_id = ? AND deleted_at IS NULL').all(user.id),
-      tickets: db.prepare('SELECT ref, subject, status, created_at FROM support_tickets WHERE user_id = ?').all(user.id),
-      audit: db.prepare('SELECT at, action, target_type, target_id FROM audit_log WHERE actor_id = ? ORDER BY at DESC LIMIT 500').all(user.id),
+      stats: await statsFor(db, user.id),
+      sessions: await db.all('SELECT created_at, last_seen, expires_at, ip_trunc, device_label FROM sessions WHERE user_id = ?', [user.id]),
+      oauth: await db.all('SELECT provider, linked_at FROM oauth_identities WHERE user_id = ?', [user.id]),
+      servers: await db.all('SELECT name, host, port, status FROM servers WHERE owner_id = ? AND deleted_at IS NULL', [user.id]),
+      tickets: await db.all('SELECT ref, subject, status, created_at FROM support_tickets WHERE user_id = ?', [user.id]),
+      audit: await db.all('SELECT at, action, target_type, target_id FROM audit_log WHERE actor_id = ? ORDER BY at DESC LIMIT 500', [user.id]),
     };
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: user.id, actorRole: user.role, action: 'account.export',
       targetType: 'user', targetId: user.id, ipTrunc: req.ipTrunc,
     });
@@ -228,10 +221,9 @@ export function accountRoutes(db: DB): Router {
       }
     }
     const now = Date.now();
-    db.prepare('UPDATE users SET deletion_requested_at = ?, purge_after = ?, status = ?, updated_at = ? WHERE id = ?')
-      .run(now, now + DELETION_GRACE_MS, 'pending_deletion', now, req.user!.id);
-    revokeAllForUser(db, req.user!.id, null, 'account_deletion');
-    appendAudit(db, {
+    await db.run('UPDATE users SET deletion_requested_at = ?, purge_after = ?, status = ?, updated_at = ? WHERE id = ?', [now, now + DELETION_GRACE_MS, 'pending_deletion', now, req.user!.id]);
+    await revokeAllForUser(db, req.user!.id, null, 'account_deletion');
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'account.deletion_requested',
       targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc,
       meta: { mirageId: req.user!.mirage_id, purgeAfter: now + DELETION_GRACE_MS },
@@ -245,22 +237,20 @@ export function accountRoutes(db: DB): Router {
     });
   });
 
-  router.post('/delete/cancel', (req, res) => {
+  router.post('/delete/cancel', async (req, res) => {
     const now = Date.now();
-    const info = db.prepare("UPDATE users SET deletion_requested_at = NULL, purge_after = NULL, status = 'active', updated_at = ? WHERE id = ? AND status = 'pending_deletion'")
-      .run(now, req.user!.id);
+    const info = await db.run("UPDATE users SET deletion_requested_at = NULL, purge_after = NULL, status = 'active', updated_at = ? WHERE id = ? AND status = 'pending_deletion'", [now, req.user!.id]);
     if (!info.changes) return res.status(409).json({ error: 'not_pending' });
-    appendAudit(db, {
+    await appendAudit(db, {
       actorId: req.user!.id, actorRole: req.user!.role, action: 'account.deletion_cancelled',
       targetType: 'user', targetId: req.user!.id, ipTrunc: req.ipTrunc,
     });
     res.json({ ok: true });
   });
 
-  router.get('/search-wiki', (req, res) => {
+  router.get('/search-wiki', async (req, res) => {
     const q = normaliseSearch(String(req.query.q ?? ''));
-    const rows = db.prepare("SELECT slug FROM content WHERE type = 'wiki' AND status = 'published' AND lower(slug) LIKE ? LIMIT 10")
-      .all(`%${q}%`) as { slug: string }[];
+    const rows = await db.all("SELECT slug FROM content WHERE type = 'wiki' AND status = 'published' AND lower(slug) LIKE ? LIMIT 10", [`%${q}%`]) as { slug: string }[];
     res.json({ results: rows });
   });
 

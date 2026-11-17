@@ -3,4 +3,6 @@
 process.env.THROTTLE_BASE_DELAY_MS = '1';
 process.env.THROTTLE_MAX_DELAY_MS = '5';
 process.env.NODE_ENV = 'test';
+// Deterministic platform / OAuth fixtures, never available in production.
+process.env.PLATFORM_MODE = 'fixture';
 process.env.BACKUP_ENCRYPTION_KEY = 'test-only-backup-key-0123456789abcdef';

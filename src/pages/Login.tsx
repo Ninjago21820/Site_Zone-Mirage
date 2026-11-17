@@ -1,13 +1,12 @@
 import { useState } from 'react';
 import { useNavigate, useSearchParams, Link } from 'react-router-dom';
-import { KeyRound, ShieldCheck, Fingerprint } from 'lucide-react';
+import { ShieldCheck, Fingerprint } from 'lucide-react';
 import { useI18n } from '../i18n';
 import { apiGet, apiPost, ApiError } from '../lib/api';
 import { useAuth } from '../context/AuthContext';
 import { getPasskeyAssertion, passkeysSupported } from '../lib/passkeys';
 import { Badge, Button, Field, Notice, Panel, TextInput } from '../components/ui';
 
-interface DemoAccount { username: string; role: string; staff: boolean }
 
 export default function Login() {
   const { t } = useI18n();
@@ -22,33 +21,7 @@ export default function Login() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [challenge, setChallenge] = useState<{ token: string; required: boolean } | null>(null);
-  const [demo, setDemo] = useState<any>(null);
   const [methods, setMethods] = useState<{ totp: boolean; passkey: boolean; backupCodes: boolean } | null>(null);
-
-  async function loadDemo() {
-    if (demo) { setDemo(null); return; }
-    try {
-      const data = await apiGet<any>('/api/auth/demo');
-      setDemo(data);
-    } catch {
-      setDemo(null);
-    }
-  }
-
-  async function fillDemo(account: DemoAccount) {
-    setIdentifier(account.username);
-    setPassword(account.staff ? demo?.password?.staff : demo?.password?.player);
-    setError(null);
-  }
-
-  async function fillTotp(username: string) {
-    try {
-      const data = await apiGet<any>(`/api/auth/demo/totp?username=${encodeURIComponent(username)}`);
-      setCode(data.code);
-    } catch {
-      setError('Code de démonstration indisponible.');
-    }
-  }
 
   async function submitPassword(e: React.FormEvent) {
     e.preventDefault();
@@ -222,43 +195,6 @@ export default function Login() {
         </div>
 
         <aside className="space-y-4">
-          <Panel className="p-5">
-            <div className="flex items-center gap-2 mb-2">
-              <KeyRound className="h-4 w-4 text-alert-400" aria-hidden />
-              <h2 className="zm-label">{t('auth.demoPanel')}</h2>
-            </div>
-            <p className="text-[11.5px] text-bone-400 leading-relaxed">{t('auth.demoBody')}</p>
-            <Button size="sm" variant="outline" className="mt-3 w-full" onClick={loadDemo} type="button">
-              {demo ? 'Masquer les comptes' : 'Afficher les comptes de démonstration'}
-            </Button>
-            {demo && (
-              <div className="mt-3 space-y-2">
-                <p className="font-mono text-[9.5px] uppercase tracking-[0.1em] text-bone-500">
-                  Mot de passe joueur : <span className="text-bone-300">{demo.password.player}</span><br />
-                  Mot de passe personnel : <span className="text-bone-300">{demo.password.staff}</span>
-                </p>
-                <ul className="space-y-1 max-h-64 overflow-y-auto">
-                  {demo.accounts.map((account: DemoAccount) => (
-                    <li key={account.username} className="flex items-center gap-2">
-                      <button type="button" onClick={() => fillDemo(account)}
-                        className="flex-1 text-left px-2 py-1.5 border border-ink-600 rounded-[2px] hover:border-alert-600">
-                        <span className="block font-mono text-[11px] text-bone-200">{account.username}</span>
-                        <span className="block font-mono text-[9px] text-bone-500">{account.role}</span>
-                      </button>
-                      {account.staff && (
-                        <button type="button" onClick={() => fillTotp(account.username)} title="Obtenir un code TOTP courant"
-                          className="px-2 py-1.5 border border-ink-600 rounded-[2px] font-mono text-[9px] text-alert-300 hover:border-alert-600">
-                          TOTP
-                        </button>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-                <p className="font-mono text-[9px] text-bone-600 leading-relaxed">{demo.note}</p>
-              </div>
-            )}
-          </Panel>
-
           <Panel className="p-5">
             <h2 className="zm-label mb-2">Sécurité de connexion</h2>
             <ul className="space-y-1.5 text-[11.5px] text-bone-400 leading-relaxed">

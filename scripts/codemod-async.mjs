@@ -1,17 +1,21 @@
 /**
  * Codemod de migration vers la couche de données asynchrone (MySQL).
  *
- * Transforme `db.prepare(SQL).get(a, b)` en `await db.get(SQL, [a, b])`, puis
- * propage `async` / `await` dans tout le graphe d'appels jusqu'à stabilité.
+ * 1. `db.prepare(SQL).get(a, b)` → `await db.get(SQL, [a, b])`
+ * 2. propagation de `async` / `await` dans le graphe d'appels jusqu'à stabilité.
+ *
+ * L'idempotence est garantie en relisant le texte avant chaque insertion
+ * (`async` / `await` déjà présents) : le codemod peut être relancé sans risque.
  *
  * Usage : node scripts/codemod-async.mjs
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import ts from 'typescript';
+import ts from 'typescript5';
 
 const ROOT = process.cwd();
-const TARGETS = ['server'];
+const TARGET_DIRS = process.argv.includes('--tests') ? ['tests'] : ['server'];
+const DRY = process.argv.includes('--dry');
 
 function walk(dir) {
   const out = [];
@@ -23,95 +27,90 @@ function walk(dir) {
   return out;
 }
 
-const files = TARGETS.flatMap((dir) => walk(path.join(ROOT, dir)));
+const files = TARGET_DIRS.flatMap((dir) => walk(path.join(ROOT, dir)));
 const state = new Map(files.map((file) => [file, fs.readFileSync(file, 'utf8')]));
 
-function parse(file, text) {
-  return ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
-}
+const parse = (file, text) => ts.createSourceFile(file, text, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
 
 function applyEdits(file, edits) {
   const text = state.get(file);
-  const sorted = [...edits].sort((a, b) => b.start - a.start);
   let out = text;
-  for (const edit of sorted) out = out.slice(0, edit.start) + edit.text + out.slice(edit.end ?? edit.start);
+  for (const edit of [...edits].sort((a, b) => b.start - a.start)) {
+    out = out.slice(0, edit.start) + edit.text + out.slice(edit.end ?? edit.start);
+  }
   state.set(file, out);
 }
 
-/* ------------------------------------------------------------------ *
- * Phase A — `db.prepare(...).get(...)` → `await db.get(sql, [params])`
- * ------------------------------------------------------------------ */
-
 const DB_METHODS = new Set(['get', 'all', 'run', 'pluck']);
 
+/* ------------------------------- Phase A ------------------------------- */
+
 for (const file of files) {
-  const text = state.get(file);
-  const source = parse(file, text);
+  const source = parse(file, state.get(file));
   const edits = [];
   const preparedVars = new Map();
 
   const visit = (node) => {
-    if (ts.isVariableDeclaration(node) && node.initializer && ts.isCallExpression(node.initializer)) {
+    if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer && ts.isCallExpression(node.initializer)) {
       const init = node.initializer;
       const callee = init.expression;
-      if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'prepare' && ts.isIdentifier(callee.expression)) {
-        if (init.arguments.length === 1) {
-          preparedVars.set(node.name.getText(source), init.arguments[0].getText(source));
-          edits.push({ start: node.getStart(source), end: node.getEnd(), text: '' });
-        }
+      if (ts.isPropertyAccessExpression(callee) && callee.name.text === 'prepare' && init.arguments.length === 1) {
+        preparedVars.set(node.name.text, init.arguments[0].getText(source));
+        edits.push({ start: node.getStart(source), end: node.getEnd(), text: '' });
       }
     }
-
-    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression)) {
-      const method = node.expression.name.text;
-      const inner = node.expression.expression;
-
-      // db.prepare(sql).method(args)
-      if (DB_METHODS.has(method) && ts.isCallExpression(inner) &&
-          ts.isPropertyAccessExpression(inner.expression) &&
-          inner.expression.name.text === 'prepare' && ts.isIdentifier(inner.expression.expression)) {
-        const sql = inner.arguments[0].getText(source);
-        const args = node.arguments.map((argument) => argument.getText(source));
-        const params = args.length ? `, [${args.join(', ')}]` : '';
-        edits.push({ start: node.getStart(source), end: node.getEnd(), text: `await db.${method}(${sql}${params})` });
-      }
-
-      // prepared variable: stmt.method(args)
-      if (DB_METHODS.has(method) && ts.isIdentifier(inner) && preparedVars.has(inner.text)) {
-        const sql = preparedVars.get(inner.text);
-        const args = node.arguments.map((argument) => argument.getText(source));
-        const params = args.length ? `, [${args.join(', ')}]` : '';
-        edits.push({ start: node.getStart(source), end: node.getEnd(), text: `await db.${method}(${sql}${params})` });
-      }
-
-      // db.exec(sql)
-      if (method === 'exec' && ts.isIdentifier(inner) && inner.text === 'db') {
-        edits.push({ start: node.getStart(source), end: node.getEnd(), text: `await db.exec(${node.arguments.map((a) => a.getText(source)).join(', ')})` });
-      }
-    }
-
     ts.forEachChild(node, visit);
   };
   visit(source);
   applyEdits(file, edits);
+
+  const source2 = parse(file, state.get(file));
+  const edits2 = [];
+  const visit2 = (node) => {
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) && DB_METHODS.has(node.expression.name.text)) {
+      const method = node.expression.name.text;
+      const inner = node.expression.expression;
+      const args = node.arguments.map((argument) => argument.getText(source2));
+      const params = args.length ? `, [${args.join(', ')}]` : '';
+      const receiver = ts.isCallExpression(inner) && ts.isPropertyAccessExpression(inner.expression)
+        ? inner.expression.expression.getText(source2)
+        : '';
+      if (ts.isCallExpression(inner) && ts.isPropertyAccessExpression(inner.expression) &&
+          inner.expression.name.text === 'prepare' && inner.arguments.length === 1) {
+        const sql = inner.arguments[0].getText(source2);
+        edits2.push({ start: node.getStart(source2), end: node.getEnd(), text: `await ${receiver}.${method}(${sql}${params})` });
+      } else if (ts.isIdentifier(inner) && preparedVars.has(inner.text)) {
+        edits2.push({ start: node.getStart(source2), end: node.getEnd(), text: `await db.${method}(${preparedVars.get(inner.text)}${params})` });
+      }
+    }
+    if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
+        node.expression.name.text === 'exec' && ts.isIdentifier(node.expression.expression) &&
+        node.expression.expression.text === 'db') {
+      const args = node.arguments.map((argument) => argument.getText(source2));
+      edits2.push({ start: node.getStart(source2), end: node.getEnd(), text: `await db.exec(${args.join(', ')})` });
+    }
+    ts.forEachChild(node, visit2);
+  };
+  visit2(source2);
+  applyEdits(file, edits2);
 }
 
-/* ------------------------------------------------------------------ *
- * Phase B — propagation de async/await
- * ------------------------------------------------------------------ */
+// On écrit la phase A sur disque avant la phase B : les passes suivantes
+// analysent l'AST réellement à jour (sinon les offsets dérivent).
+if (!DRY) for (const [file, text] of state) fs.writeFileSync(file, text);
+
+/* ------------------------------- Phase B ------------------------------- */
 
 const SEED_ASYNC = new Set(['openDb', 'migrate', 'seedDemo', 'insertSnapshot']);
 
-function fnName(node, source) {
+function fnName(node) {
   if (!node) return null;
   if (ts.isFunctionDeclaration(node) && node.name) return node.name.text;
   if (ts.isMethodDeclaration(node) && ts.isIdentifier(node.name)) return node.name.text;
-  if (ts.isPropertyAssignment(node) && ts.isIdentifier(node.name)) return node.name.text;
   if ((ts.isArrowFunction(node) || ts.isFunctionExpression(node)) && ts.isVariableDeclaration(node.parent) && ts.isIdentifier(node.parent.name)) {
     return node.parent.name.text;
   }
-  if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name)) return node.name.text;
-  void source;
+  if (ts.isPropertyAssignment(node) && ts.isIdentifier(node.name)) return node.name.text;
   return null;
 }
 
@@ -124,114 +123,96 @@ function containingFunction(node) {
   return null;
 }
 
-let rounds = 0;
-for (;;) {
-  rounds += 1;
-  if (rounds > 15) {
-    console.log('limite de passes atteinte');
-    break;
-  }
-  // Nouvelle compilation sur l'état courant.
+function isAsync(fn, source, text) {
+  const modifiers = ts.canHaveModifiers(fn) ? (ts.getModifiers(fn) ?? []) : (fn.modifiers ?? []);
+  if (modifiers.some((modifier) => modifier.kind === ts.SyntaxKind.AsyncKeyword)) return true;
+  const start = fn.getStart(source);
+  return /async\s*$/.test(text.slice(Math.max(0, start - 24), start));
+}
+
+let total = 0;
+for (let round = 1; round <= 40; round += 1) {
   const program = ts.createProgram(files, {
     target: ts.ScriptTarget.ES2022,
     module: ts.ModuleKind.NodeNext,
     moduleResolution: ts.ModuleResolutionKind.NodeNext,
-    allowJs: false,
     skipLibCheck: true,
     noEmit: true,
     strict: false,
+    allowJs: false,
   });
   const checker = program.getTypeChecker();
-  let changed = 0;
 
   const asyncKeys = new Set(SEED_ASYNC);
-  const collect = (file) => {
+  for (const file of files) {
     const source = program.getSourceFile(file);
-    if (!source) return;
+    if (!source) continue;
     const visit = (node) => {
-      if (ts.isFunctionLike(node)) {
-        let hasAwait = false;
-        const scan = (child) => {
-          if (child !== node && ts.isFunctionLike(child)) return;
-          if (ts.isAwaitExpression(child)) hasAwait = true;
-          ts.forEachChild(child, scan);
-        };
-        scan(node);
-        const name = fnName(node, source);
-        if (name && (hasAwait || (ts.getModifiers(node) ?? []).some((m) => m.kind === ts.SyntaxKind.AsyncKeyword))) {
-          asyncKeys.add(name);
-        }
-      }
+      if (ts.isFunctionLike(node) && fnName(node) && isAsync(node, source, state.get(file))) asyncKeys.add(fnName(node));
       ts.forEachChild(node, visit);
     };
     visit(source);
-  };
-  files.forEach(collect);
+  }
 
+  let changed = 0;
   for (const file of files) {
     const source = program.getSourceFile(file);
     if (!source) continue;
     const text = state.get(file);
-    const edits = [];
-    const marked = new Set();
+    const edits = new Map();
+
+    const addEdit = (start, value) => {
+      if (!edits.has(start)) edits.set(start, { start, text: value });
+    };
 
     const markAsync = (fn) => {
       if (!fn) return;
-      const modifiers = ts.getModifiers(fn) ?? [];
-      if (modifiers.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) return;
-      if (marked.has(fn.getStart(source))) return;
-      marked.add(fn.getStart(source));
-      if (ts.isFunctionDeclaration(fn) || ts.isFunctionExpression(fn)) {
-        edits.push({ start: fn.getStart(source), text: 'async ' });
-      } else if (ts.isArrowFunction(fn)) {
-        edits.push({ start: fn.getStart(source), text: 'async ' });
-      } else {
-        edits.push({ start: fn.getStart(source), text: 'async ' });
-      }
+      if (isAsync(fn, source, text)) return;
+      addEdit(fn.getStart(source), 'async ');
     };
 
     const visit = (node) => {
-      if (ts.isAwaitExpression(node)) {
-        markAsync(containingFunction(node));
-      }
-      if (ts.isCallExpression(node) && node.expression) {
+      if (ts.isAwaitExpression(node)) markAsync(containingFunction(node));
+
+      if (ts.isCallExpression(node)) {
+        const start = node.getStart(source);
+        const before = text.slice(Math.max(0, start - 12), start);
+        const alreadyAwaited = ts.isAwaitExpression(node.parent) || /await\s*$/.test(before);
         let declaration = null;
         try {
-          const signature = checker.getResolvedSignature(node);
-          declaration = signature?.declaration ?? null;
+          declaration = checker.getResolvedSignature(node)?.declaration ?? null;
         } catch {
           declaration = null;
         }
-        const name = declaration ? fnName(declaration, source) : null;
-        const calleeName = ts.isIdentifier(node.expression) ? node.expression.text : null;
-        const isAsyncCallee = (name && asyncKeys.has(name)) || (calleeName && SEED_ASYNC.has(calleeName));
-        if (isAsyncCallee && !(ts.isAwaitExpression(node.parent))) {
-          edits.push({ start: node.getStart(source), text: 'await ' });
+        const name = fnName(declaration);
+        const callee = ts.isIdentifier(node.expression) ? node.expression.text : null;
+        const asyncCallee = (name && asyncKeys.has(name)) || (callee && SEED_ASYNC.has(callee));
+        if (asyncCallee && !alreadyAwaited) {
+          addEdit(start, 'await ');
           markAsync(containingFunction(node));
-          changed += 1;
         }
       }
       ts.forEachChild(node, visit);
     };
     visit(source);
 
-    // Dédoublonne les insertions au même point.
-    const unique = new Map();
-    for (const edit of edits) {
-      if (!unique.has(edit.start)) unique.set(edit.start, edit);
+    if (edits.size) {
+      changed += edits.size;
+      if (!DRY) applyEdits(file, [...edits.values()]);
     }
-    if (unique.size) {
-      changed += unique.size;
-      applyEdits(file, [...unique.values()]);
-    }
-    void text;
   }
 
-  console.log(`passe ${rounds} — ${changed} modifications`);
-  if (changed === 0) break;
+  total += changed;
+  console.log(`passe ${round} — ${changed} modifications`);
+  if (!DRY && changed > 0) {
+    // Le programme TypeScript se relit depuis le disque : on y écrit l'état
+    // intermédiaire pour que chaque passe analyse réellement le code courant.
+    for (const [file, text] of state) fs.writeFileSync(file, text);
+  }
+  if (changed === 0 || DRY) break;
 }
 
-for (const [file, text] of state) {
-  fs.writeFileSync(file, text);
+if (!DRY) {
+  for (const [file, text] of state) fs.writeFileSync(file, text);
 }
-console.log(`${files.length} fichiers réécrits`);
+console.log(`${files.length} fichiers, ${total} modifications`);

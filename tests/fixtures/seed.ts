@@ -1,16 +1,18 @@
 /**
- * Jeu de données de démonstration — **jamais exécuté en production**.
- * Il n'est chargé que par `npm run db:seed:demo` pour peupler un
- * environnement de développement ou de recette.
+ * Fixtures de la suite de tests d'intégration.
+ *
+ * Ce module vit sous `tests/` : il n'est **jamais** importé par le serveur, donc
+ * aucun compte ni contenu de démonstration ne peut exister sur le site réel.
+ * Chaque test repart d'une base SQLite `:memory:` peuplée par `seedFixtures()`.
  */
 import argon2 from 'argon2';
-import { randomBytes } from 'node:crypto';
-import type { DB } from '../db.js';
-import { mirageIdFor } from './ids.js';
+import { createHash, randomBytes } from 'node:crypto';
+import { NOW, type DB, type Role } from '../../server/db.js';
+import { mirageIdFor } from '../../server/lib/ids.js';
 
-export const DEMO_PASSWORD = 'Mirage-Demo-2026';
-export const DEMO_STAFF_PASSWORD = 'Mirage-Staff-2026';
-export const DEMO_TOTP_SECRET = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
+export const FIXTURE_PLAYER_PASSWORD = 'Mirage-Demo-2026';
+export const FIXTURE_STAFF_PASSWORD = 'Mirage-Staff-2026';
+export const FIXTURE_TOTP_SECRET = 'JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP';
 
 const ph = '[À définir]';
 
@@ -27,7 +29,7 @@ type SeedNode = {
   wiki?: string;
 };
 
-function seedMap(db: DB) {
+async function seedMap(db: DB) {
   const floors = [
     ['f0', 'Niveau 0 — Accueil & Sécurité', 0, 0],
     ['f1', 'Niveau 1 — Laboratoires', 1, 1],
@@ -35,8 +37,8 @@ function seedMap(db: DB) {
     ['f3', 'Niveau 3 — Logistique & Archives', 3, 3],
     ['b1', 'Sous-sol 1 — Énergie', -1, 4],
   ] as const;
-  const insFloor = db.prepare('INSERT INTO map_floors (id,label,level,order_index) VALUES (?,?,?,?)');
-  for (const f of floors) insFloor.run(...f);
+  
+  for (const f of floors) await db.run('INSERT INTO map_floors (id,label,level,order_index) VALUES (?,?,?,?)', [...f]);
 
   const nodes: SeedNode[] = [
     { id: 'n0-1', floor: 'f0', code: 'ZM-000', label: 'Sas d’entrée principal', kind: 'entrance', x: 50, y: 88 },
@@ -71,11 +73,9 @@ function seedMap(db: DB) {
     { id: 'b1-2', floor: 'b1', code: 'ZM-401', label: 'Générateurs', kind: 'utility', x: 30, y: 62, restricted: true, clearance: 'N3' },
     { id: 'b1-3', floor: 'b1', code: 'ZM-402', label: 'Local technique', kind: 'utility', x: 70, y: 62 },
   ];
-  const insNode = db.prepare(
-    'INSERT INTO map_nodes (id,floor_id,code,label,kind,x,y,restricted,clearance,wiki_slug) VALUES (?,?,?,?,?,?,?,?,?,?)',
-  );
+  
   for (const n of nodes)
-    insNode.run(n.id, n.floor, n.code, n.label, n.kind, n.x, n.y, n.restricted ? 1 : 0, n.clearance ?? null, n.wiki ?? null);
+    await db.run('INSERT INTO map_nodes (id,floor_id,code,label,kind,x,y,restricted,clearance,wiki_slug) VALUES (?,?,?,?,?,?,?,?,?,?)', [n.id, n.floor, n.code, n.label, n.kind, n.x, n.y, n.restricted ? 1 : 0, n.clearance ?? null, n.wiki ?? null]);
 
   const edges: [string, string, string, number, boolean][] = [
     ['n0-1', 'n0-2', 'corridor', 1, false],
@@ -111,18 +111,16 @@ function seedMap(db: DB) {
     ['b1-1', 'b1-3', 'corridor', 1, false],
     ['n1-6', 'n2-5', 'elevator', 1.5, true],
   ];
-  const insEdge = db.prepare('INSERT INTO map_edges (id,from_node,to_node,kind,distance,restricted) VALUES (?,?,?,?,?,?)');
-  edges.forEach(([a, b, kind, d, r], i) => insEdge.run(`e${i + 1}-f`, a, b, kind, d, r ? 1 : 0));
+  
+  for (const [i, [a, b, kind, d, r]] of edges.entries()) {
+    await db.run('INSERT INTO map_edges (id,from_node,to_node,kind,distance,restricted) VALUES (?,?,?,?,?,?)', [`e${i + 1}-f`, a, b, kind, d, r ? 1 : 0]);
+  }
 }
 
-function seedContent(db: DB) {
+async function seedContent(db: DB) {
   const now = NOW();
-  const insContent = db.prepare(`INSERT INTO content
-    (id,type,status,slug,category,author_id,verifier_id,published_at,spoiler,acs_level,clearance,seo_title,seo_desc,featured,order_index,created_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
-  const insTr = db.prepare(
-    'INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)',
-  );
+  
+  
   const news = [
     {
       slug: 'ouverture-du-site-officiel',
@@ -170,16 +168,15 @@ function seedContent(db: DB) {
   ];
 
   const base = now - 1000 * 60 * 60 * 24 * 20;
-  news.forEach((n, i) => {
+  for (const [i, n] of news.entries()) {
     const id = `news-${i + 1}`;
     const at = base + i * 1000 * 60 * 60 * 26;
-    insContent.run(
-      id, 'news', 'published', n.slug, n.category, 'u-admin', 'u-admin', at,
-      0, null, null, n.title, n.summary, n.featured ?? 0, i, at, at,
-    );
-    insTr.run(id, 'fr', n.title, n.summary, n.body);
-    insTr.run(id, 'en', n.title, n.summary, `> English translation pending (Crowdin).\n\n${n.body}`);
-  });
+    await db.run(`INSERT INTO content
+    (id,type,status,slug,category,author_id,verifier_id,published_at,spoiler,acs_level,clearance,seo_title,seo_desc,featured,order_index,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, 'news', 'published', n.slug, n.category, 'u-admin', 'u-admin', at, 0, null, null, n.title, n.summary, n.featured ?? 0, i, at, at]);
+    await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)', [id, 'fr', n.title, n.summary, n.body]);
+    await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)', [id, 'en', n.title, n.summary, `> English translation pending (Crowdin).\n\n${n.body}`]);
+  }
 
   const roadmap: [string, string, string, string][] = [
     ['J1 — Fondations', 'in_progress', 'Cadrage technique, architecture du site, socle de sécurité (authentification, sessions, journal d’audit).', ph],
@@ -191,11 +188,13 @@ function seedContent(db: DB) {
     ['J7 — API jeu & plateforme', 'planned', 'Vérification de licence, tickets de session, synchronisation des statistiques.', ph],
     ['J8 — Durcissement & livraison', 'planned', 'Tests de sécurité, sauvegardes vérifiées, accessibilité, internationalisation.', ph],
   ];
-  roadmap.forEach(([title, status, summary, body], i) => {
+  for (const [i, [title, status, summary, body]] of roadmap.entries()) {
     const id = `road-${i + 1}`;
-    insContent.run(id, 'roadmap', 'published', `jalon-${i + 1}`, status, 'u-admin', 'u-admin', now, 0, null, null, title, summary, 0, i, now, now);
-    insTr.run(id, 'fr', title, summary, `${summary}\n\nDétail du jalon : ${body}`);
-  });
+    await db.run(`INSERT INTO content
+    (id,type,status,slug,category,author_id,verifier_id,published_at,spoiler,acs_level,clearance,seo_title,seo_desc,featured,order_index,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, 'roadmap', 'published', `jalon-${i + 1}`, status, 'u-admin', 'u-admin', now, 0, null, null, title, summary, 0, i, now, now]);
+    await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)', [id, 'fr', title, summary, `${summary}\n\nDétail du jalon : ${body}`]);
+  }
 
   const wiki: {
     slug: string; title: string; summary: string; acs: string; clearance: string; cat: string; spoiler?: number;
@@ -270,11 +269,13 @@ function seedContent(db: DB) {
     pending: `## En-tête ACS\n\n| Champ | Valeur |\n| --- | --- |\n| Classe d’objet | ${ph} |\n| Niveau de perturbation | ${ph} |\n| Niveau de risque | ${ph} |\n| Procédures de confinement | ${ph} |\n\n> Cette fiche est un **gabarit**. L’équipe de rédaction doit fournir le contenu définitif. Aucune donnée de lore n’est inventée par le site.`,
     none: `## Contenu\n\nCette page est un **gabarit de structure**. Le contenu définitif sera fourni par l’équipe (${ph}).\n\n- Section 1 : ${ph}\n- Section 2 : ${ph}`,
   };
-  wiki.forEach((w, i) => {
+  for (const [i, w] of wiki.entries()) {
     const id = `wiki-${i + 1}`;
-    insContent.run(id, 'wiki', 'published', w.slug, w.cat, 'u-admin', 'u-admin', now, w.spoiler ?? 0, w.acs, w.clearance, w.title, w.summary, 0, i, now, now);
-    insTr.run(id, 'fr', w.title, w.summary, `## ${w.title}\n\n${w.summary}\n\n${acsBodies[w.acs] ?? acsBodies.none}`);
-  });
+    await db.run(`INSERT INTO content
+    (id,type,status,slug,category,author_id,verifier_id,published_at,spoiler,acs_level,clearance,seo_title,seo_desc,featured,order_index,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, 'wiki', 'published', w.slug, w.cat, 'u-admin', 'u-admin', now, w.spoiler ?? 0, w.acs, w.clearance, w.title, w.summary, 0, i, now, now]);
+    await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)', [id, 'fr', w.title, w.summary, `## ${w.title}\n\n${w.summary}\n\n${acsBodies[w.acs] ?? acsBodies.none}`]);
+  }
 
   const faq = [
     ['Quelle est la date de sortie ?', 'Aucune date de sortie n’est annoncée. SCP: Mirage Protocol est en cours de développement.'],
@@ -292,11 +293,13 @@ function seedContent(db: DB) {
     ['Comment signaler un problème ?', 'Via la page Support. Les signalements concernant la sécurité sont traités en priorité.'],
     ['Le wiki est-il ouvert aux contributions ?', 'Non. Le wiki est rédigé exclusivement par l’équipe. Les propositions peuvent être transmises via le support.'],
   ];
-  faq.forEach(([q, a], i) => {
+  for (const [i, [q, a]] of faq.entries()) {
     const id = `faq-${i + 1}`;
-    insContent.run(id, 'faq', 'published', `question-${i + 1}`, 'general', 'u-admin', 'u-admin', now, 0, null, null, q, a, 0, i, now, now);
-    insTr.run(id, 'fr', q, a, a);
-  });
+    await db.run(`INSERT INTO content
+    (id,type,status,slug,category,author_id,verifier_id,published_at,spoiler,acs_level,clearance,seo_title,seo_desc,featured,order_index,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, 'faq', 'published', `question-${i + 1}`, 'general', 'u-admin', 'u-admin', now, 0, null, null, q, a, 0, i, now, now]);
+    await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)', [id, 'fr', q, a, a]);
+  }
 
   const legal: [string, string, string][] = [
     ['mentions-legales', 'Mentions légales', 'Éditeur du site, hébergeur et coordonnées de contact. Les informations d’identification de la société restent à fournir par la structure éditrice.'],
@@ -305,32 +308,38 @@ function seedContent(db: DB) {
     ['cgu', 'Conditions générales d’utilisation', 'Règles d’usage du site, du wiki et du référencement des serveurs communautaires, ainsi que les modalités de sanction des comptes.'],
     ['licence-cc-by-sa', 'Licence CC BY-SA 3.0', 'Le contenu du wiki est publié sous licence Creative Commons Attribution – Partage dans les mêmes conditions 3.0.'],
   ];
-  legal.forEach(([slug, title, summary], i) => {
+  for (const [i, [slug, title, summary]] of legal.entries()) {
     const id = `legal-${i + 1}`;
-    insContent.run(id, 'legal', 'published', slug, 'legal', 'u-admin', 'u-admin', now, 0, null, null, title, summary, 0, i, now, now);
-    insTr.run(id, 'fr', title, summary, `## ${title}\n\n${summary}\n\n### Détail\n\n${ph}\n\n> Gabarit juridique de substitution. Le texte définitif doit être validé par le service juridique avant publication.`);
-  });
+    await db.run(`INSERT INTO content
+    (id,type,status,slug,category,author_id,verifier_id,published_at,spoiler,acs_level,clearance,seo_title,seo_desc,featured,order_index,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, 'legal', 'published', slug, 'legal', 'u-admin', 'u-admin', now, 0, null, null, title, summary, 0, i, now, now]);
+    await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)', [id, 'fr', title, summary, `## ${title}\n\n${summary}\n\n### Détail\n\n${ph}\n\n> Gabarit juridique de substitution. Le texte définitif doit être validé par le service juridique avant publication.`]);
+  }
 
   const extras: [string, string, string][] = [
     ['schematics', 'Schémas', 'Schémas techniques réservés aux acheteurs (aucun visuel fourni à ce stade).'],
     ['artwork', 'Illustrations', 'Galerie d’illustrations réservée aux acheteurs (visuels à fournir).'],
     ['making-of', 'Making-of', 'Contenus de production réservés aux acheteurs (à fournir).'],
   ];
-  extras.forEach(([slug, title, summary], i) => {
+  for (const [i, [slug, title, summary]] of extras.entries()) {
     const id = `extra-${i + 1}`;
-    insContent.run(id, 'buyer_extras', 'published', slug, 'extras', 'u-admin', 'u-admin', now, 0, null, null, title, summary, 0, i, now, now);
-    insTr.run(id, 'fr', title, summary, `${summary}\n\n> Contenu réservé aux acheteurs. Aucun fichier n’est distribué depuis ce site.\n\nDétail : ${ph}`);
-  });
+    await db.run(`INSERT INTO content
+    (id,type,status,slug,category,author_id,verifier_id,published_at,spoiler,acs_level,clearance,seo_title,seo_desc,featured,order_index,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, 'buyer_extras', 'published', slug, 'extras', 'u-admin', 'u-admin', now, 0, null, null, title, summary, 0, i, now, now]);
+    await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)', [id, 'fr', title, summary, `${summary}\n\n> Contenu réservé aux acheteurs. Aucun fichier n’est distribué depuis ce site.\n\nDétail : ${ph}`]);
+  }
 
   const mapContent: [string, string, string][] = [
     ['zone-mirage-carte', 'Zone Mirage — carte', 'Plan schématique multi-niveaux de la Zone Mirage.'],
     ['legende', 'Légende de la carte', 'Couloirs, escaliers, ascenseurs et accès restreints.'],
   ];
-  mapContent.forEach(([slug, title, summary], i) => {
+  for (const [i, [slug, title, summary]] of mapContent.entries()) {
     const id = `mapdoc-${i + 1}`;
-    insContent.run(id, 'map', 'published', slug, 'carte', 'u-admin', 'u-admin', now, 0, null, null, title, summary, 0, i, now, now);
-    insTr.run(id, 'fr', title, summary, summary);
-  });
+    await db.run(`INSERT INTO content
+    (id,type,status,slug,category,author_id,verifier_id,published_at,spoiler,acs_level,clearance,seo_title,seo_desc,featured,order_index,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, 'map', 'published', slug, 'carte', 'u-admin', 'u-admin', now, 0, null, null, title, summary, 0, i, now, now]);
+    await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)', [id, 'fr', title, summary, summary]);
+  }
 
   // Editorial workflow sample: draft + review + scheduled to exercise the back-office
   const sample = [
@@ -338,26 +347,25 @@ function seedContent(db: DB) {
     ['news', 'gabarit-article-en-verification', 'Gabarit — article en vérification', 'review', 'writer'],
     ['roadmap', 'gabarit-jalon-planifie', 'Gabarit — jalon planifié', 'scheduled', 'dev'],
   ] as const;
-  sample.forEach(([type, slug, title, status, authorRole], i) => {
+  for (const [i, [type, slug, title, status, authorRole]] of sample.entries()) {
     const id = `sample-${i + 1}`;
     const author = `u-${authorRole}`;
-    insContent.run(id, type, status, slug, 'gabarit', author, null, null, 0, null, null, title, 'Gabarit de démonstration du workflow éditorial.', 0, 90 + i, now, now);
-    insTr.run(id, 'fr', title, 'Gabarit de démonstration du workflow éditorial.', `## ${title}\n\nContenu de démonstration destiné à illustrer le workflow éditorial à six statuts. Texte définitif : ${ph}.`);
-  });
+    await db.run(`INSERT INTO content
+    (id,type,status,slug,category,author_id,verifier_id,published_at,spoiler,acs_level,clearance,seo_title,seo_desc,featured,order_index,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, type, status, slug, 'gabarit', author, null, null, 0, null, null, title, 'Gabarit de démonstration du workflow éditorial.', 0, 90 + i, now, now]);
+    await db.run('INSERT INTO content_translations (content_id,locale,title,summary,body) VALUES (?,?,?,?,?)', [id, 'fr', title, 'Gabarit de démonstration du workflow éditorial.', `## ${title}\n\nContenu de démonstration destiné à illustrer le workflow éditorial à six statuts. Texte définitif : ${ph}.`]);
+  }
 }
 
-export async function seedDemo(db: DB) {
-  const count = db.prepare('SELECT COUNT(*) AS c FROM users').get() as { c: number };
+export async function seedFixtures(db: DB) {
+  const count = (await db.get('SELECT COUNT(*) AS c FROM users')) as { c: number };
   if (count.c > 0) return;
 
   const now = NOW();
-  const playerHash = await argon2.hash(DEMO_PASSWORD, { type: argon2.argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 });
-  const staffHash = await argon2.hash(DEMO_STAFF_PASSWORD, { type: argon2.argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 });
+  const playerHash = await argon2.hash(FIXTURE_PLAYER_PASSWORD, { type: argon2.argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 });
+  const staffHash = await argon2.hash(FIXTURE_STAFF_PASSWORD, { type: argon2.argon2id, memoryCost: 19456, timeCost: 2, parallelism: 1 });
 
-  const insUser = db.prepare(`INSERT INTO users
-    (id,mirage_id,username,email,password_hash,role,status,email_verified,locale,profile_public,show_socials,socials_json,bio,
-     totp_secret,webauthn_required,created_at,updated_at)
-    VALUES (@id,@mirage_id,@username,@email,@password_hash,@role,'active',1,@locale,@public,@socials,@socials_json,@bio,@totp,@wa,@created,@updated)`);
+  
 
   const users: { id: string; username: string; role: Role; staff: boolean; public?: number }[] = [
     { id: 'u-admin', username: 'admin', role: 'admin', staff: true },
@@ -373,9 +381,12 @@ export async function seedDemo(db: DB) {
   ];
 
   for (const u of users) {
-    insUser.run({
+    await db.run(`INSERT INTO users
+    (id,mirage_id,username,email,password_hash,role,status,email_verified,locale,profile_public,show_socials,socials_json,bio,
+     totp_secret,webauthn_required,created_at,updated_at)
+    VALUES (@id,@mirage_id,@username,@email,@password_hash,@role,'active',1,@locale,@public,@socials,@socials_json,@bio,@totp,@wa,@created,@updated)`, [{
       id: u.id,
-      mirage_id: mirageIdFor(db, now - 86400000 * (30 - users.indexOf(u))),
+      mirage_id: await mirageIdFor(db, now - 86400000 * (30 - users.indexOf(u))),
       username: u.username,
       email: `${u.username}@mirage-protocol.example`,
       password_hash: u.staff ? staffHash : playerHash,
@@ -385,27 +396,25 @@ export async function seedDemo(db: DB) {
       socials: 0,
       socials_json: u.id === 'u-player' ? JSON.stringify({ discord: 'https://discord.gg/exemple', steam: 'https://steamcommunity.com/id/exemple' }) : '{}',
       bio: u.id === 'u-player' ? 'Profil de démonstration. Les données de jeu sont fictives.' : '',
-      totp: u.staff ? DEMO_TOTP_SECRET : null,
+      totp: u.staff ? FIXTURE_TOTP_SECRET : null,
       wa: u.role === 'admin' ? 1 : 0,
       created: now - 86400000 * 30,
       updated: now,
-    });
+    }]);
   }
 
   // A handful of backup codes for the demo accounts (hashed, single use).
-  const insCode = db.prepare('INSERT INTO backup_codes (id,user_id,code_hash,created_at) VALUES (?,?,?,?)');
+  
   for (const u of users) {
     for (let i = 0; i < 10; i++) {
-      insCode.run(`bc-${u.id}-${i}`, u.id, await argon2.hash(`MIRAGE-${i}${randomBytes(4).toString('hex').toUpperCase()}`, { type: argon2.argon2id, memoryCost: 8192, timeCost: 1, parallelism: 1 }), now);
+      await db.run('INSERT INTO backup_codes (id,user_id,code_hash,created_at) VALUES (?,?,?,?)', [`bc-${u.id}-${i}`, u.id, await argon2.hash(`MIRAGE-${i}${randomBytes(4).toString('hex').toUpperCase()}`, { type: argon2.argon2id, memoryCost: 8192, timeCost: 1, parallelism: 1 }), now]);
     }
   }
 
-  seedContent(db);
-  seedMap(db);
+  await seedContent(db);
+  await seedMap(db);
 
-  const insServer = db.prepare(`INSERT INTO servers
-    (id,owner_id,name,description,host,port,region,tag,status,maintenance,current_players,avg_players,max_players,validated_at,validated_by,last_online_at,created_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  
   const servers: [string, string, string, string, string, number, string, string, string, number, number, number, number, string][] = [
     ['srv-1', 'u-player', 'Serveur communautaire — gabarit 01', 'Serveur de démonstration. Données fictives.', '198.51.100.10', 7777, 'EU', 'tag-recent', 'active', 0, 18, 21.4, 32, '2026-11-10'],
     ['srv-2', 'u-player2', 'Serveur communautaire — gabarit 02', 'Serveur de démonstration. Données fictives.', '198.51.100.11', 7777, 'EU', 'tag-recent', 'active', 0, 12, 14.9, 24, '2026-11-12'],
@@ -413,41 +422,41 @@ export async function seedDemo(db: DB) {
     ['srv-4', 'u-player2', 'Serveur communautaire — gabarit 04', 'Serveur de démonstration. Données fictives.', '198.51.100.13', 7777, 'EU', '', 'active', 0, 22, 26.8, 32, '2026-10-02'],
     ['srv-5', 'u-player', 'Serveur communautaire — gabarit 05', 'Serveur de démonstration. Données fictives.', '198.51.100.14', 7777, 'EU', '', 'active', 1, 0, 4.1, 16, '2026-09-18'],
   ];
-  servers.forEach(([id, owner, name, desc, host, port, region, tag, status, maint, cur, avg, max, date], i) => {
-    insServer.run(id, owner, name, desc, host, port, region, tag, status, maint, cur, avg, max, NOW() - (5 - i) * 86400000, 'u-moderator', NOW() - 60000, NOW() - (40 - i * 5) * 86400000);
-  });
+  for (const [i, [id, owner, name, desc, host, port, region, tag, status, maint, cur, avg, max, date]] of servers.entries()) {
+    await db.run(`INSERT INTO servers
+    (id,owner_id,name,description,host,port,region,tag,status,maintenance,current_players,avg_players,max_players,validated_at,validated_by,last_online_at,created_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [id, owner, name, desc, host, port, region, tag, status, maint, cur, avg, max, NOW() - (5 - i) * 86400000, 'u-moderator', NOW() - 60000, NOW() - (40 - i * 5) * 86400000]);
+  }
 
-  const insStat = db.prepare(`INSERT INTO stat_entries
-    (id,user_id,display_name,mode,operation_code,ending_code,best_time_ms,deaths,reputation,playtime_ms,score,hidden,verified_at,updated_at)
-    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`);
+  
   const ops = ['OP-001', 'OP-002', 'OP-003'];
   const endings = ['FIN-A', 'FIN-B', 'FIN-C'];
   let n = 0;
   for (const u of users) {
     for (const [oi, op] of ops.entries()) {
       n++;
-      insStat.run(
-        `st-${n}`, u.id, u.username, 'story', op, endings[oi % endings.length],
-        420000 + ((n * 37219) % 900000), (n * 7) % 23, 100 + ((n * 13) % 900),
-        3600000 * (2 + (n % 9)), 1000 - ((n * 7919) % 900), 0, NOW() - 3600000, NOW() - 1800000,
-      );
+      await db.run(`INSERT INTO stat_entries
+    (id,user_id,display_name,mode,operation_code,ending_code,best_time_ms,deaths,reputation,playtime_ms,score,hidden,verified_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [`st-${n}`, u.id, u.username, 'story', op, endings[oi % endings.length], 420000 + ((n * 37219) % 900000), (n * 7) % 23, 100 + ((n * 13) % 900), 3600000 * (2 + (n % 9)), 1000 - ((n * 7919) % 900), 0, NOW() - 3600000, NOW() - 1800000]);
     }
     n++;
-    insStat.run(`st-mp-${u.id}`, u.id, u.username, 'multiplayer', 'MP-ALL', null, null, (n * 11) % 40, 50 + (n % 400), 7200000 * (1 + (n % 5)), 500 - (n % 400), 0, NOW() - 3600000, NOW() - 1800000);
+    await db.run(`INSERT INTO stat_entries
+    (id,user_id,display_name,mode,operation_code,ending_code,best_time_ms,deaths,reputation,playtime_ms,score,hidden,verified_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)`, [`st-mp-${u.id}`, u.id, u.username, 'multiplayer', 'MP-ALL', null, null, (n * 11) % 40, 50 + (n % 400), 7200000 * (1 + (n % 5)), 500 - (n % 400), 0, NOW() - 3600000, NOW() - 1800000]);
   }
 
-  const insTicket = db.prepare('INSERT INTO support_tickets (id,ref,user_id,email,subject,category,status,priority,assigned_to,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)');
-  const insMsg = db.prepare('INSERT INTO ticket_messages (id,ticket_id,author_id,author_label,body,internal,created_at) VALUES (?,?,?,?,?,?,?)');
-  insTicket.run('tkt-1', 'SUP-0001', 'u-player', 'joueur@mirage-protocol.example', 'Signalement de sécurité — gabarit', 'security', 'open', 'high', null, NOW() - 7200000, NOW() - 7200000);
-  insMsg.run('msg-1', 'tkt-1', 'u-player', 'joueur', 'Message de démonstration concernant un signalement de sécurité.', 0, NOW() - 7200000);
-  insTicket.run('tkt-2', 'SUP-0002', null, 'anonyme@example.org', 'Question sur la date de sortie', 'game', 'open', 'normal', null, NOW() - 3600000, NOW() - 3600000);
-  insMsg.run('msg-2', 'tkt-2', null, 'anonyme', 'Question de démonstration : le jeu a-t-il une date de sortie ?', 0, NOW() - 3600000);
+  
+  
+  await db.run('INSERT INTO support_tickets (id,ref,user_id,email,subject,category,status,priority,assigned_to,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)', ['tkt-1', 'SUP-0001', 'u-player', 'joueur@mirage-protocol.example', 'Signalement de sécurité — gabarit', 'security', 'open', 'high', null, NOW() - 7200000, NOW() - 7200000]);
+  await db.run('INSERT INTO ticket_messages (id,ticket_id,author_id,author_label,body,internal,created_at) VALUES (?,?,?,?,?,?,?)', ['msg-1', 'tkt-1', 'u-player', 'joueur', 'Message de démonstration concernant un signalement de sécurité.', 0, NOW() - 7200000]);
+  await db.run('INSERT INTO support_tickets (id,ref,user_id,email,subject,category,status,priority,assigned_to,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)', ['tkt-2', 'SUP-0002', null, 'anonyme@example.org', 'Question sur la date de sortie', 'game', 'open', 'normal', null, NOW() - 3600000, NOW() - 3600000]);
+  await db.run('INSERT INTO ticket_messages (id,ticket_id,author_id,author_label,body,internal,created_at) VALUES (?,?,?,?,?,?,?)', ['msg-2', 'tkt-2', null, 'anonyme', 'Question de démonstration : le jeu a-t-il une date de sortie ?', 0, NOW() - 3600000]);
 
-  const insSetting = db.prepare('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)');
-  insSetting.run('site.version', '1.3');
-  insSetting.run('site.release_date', 'undisclosed');
-  insSetting.run('i18n.threshold', '0.85');
-  insSetting.run('i18n.progress', JSON.stringify({ fr: 1, en: 1, es: 0.12, de: 0.08, it: 0.05 }));
+  
+  await db.run('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)', ['site.version', '1.3']);
+  await db.run('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)', ['site.release_date', 'undisclosed']);
+  await db.run('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)', ['i18n.threshold', '0.85']);
+  await db.run('INSERT OR REPLACE INTO settings (key,value) VALUES (?,?)', ['i18n.progress', JSON.stringify({ fr: 1, en: 1, es: 0.12, de: 0.08, it: 0.05 })]);
 
   // First entry of the hash chain — must be hashed like every other row so
   // that verifyAuditChain() succeeds on a freshly seeded database.
@@ -455,9 +464,8 @@ export async function seedDemo(db: DB) {
   const seedHash = createHash('sha256')
     .update([now, '', 'system', 'system.seed', 'system', 'bootstrap', '', seedMeta, 'GENESIS'].join('|'))
     .digest('hex');
-  db.prepare(
+  await db.run(
     'INSERT INTO audit_log (at,actor_id,actor_role,action,target_type,target_id,ip_trunc,meta_json,prev_hash,hash) VALUES (?,?,?,?,?,?,?,?,?,?)',
-  ).run(now, null, 'system', 'system.seed', 'system', 'bootstrap', '', seedMeta, 'GENESIS', seedHash);
+    [now, null, 'system', 'system.seed', 'system', 'bootstrap', '', seedMeta, 'GENESIS', seedHash],
+  );
 }
-
-export { DEMO_PASSWORD, DEMO_STAFF_PASSWORD };

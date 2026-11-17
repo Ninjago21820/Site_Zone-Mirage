@@ -286,11 +286,6 @@ const DICT: Record<string, Entry> = {
   'auth.verify': ['Vérifier', 'Verify'],
   'auth.usePasskey': ['Utiliser une passkey', 'Use a passkey'],
   'auth.useCode': ['Utiliser un code', 'Use a code'],
-  'auth.demoPanel': ['Environnement de démonstration', 'Demo environment'],
-  'auth.demoBody': [
-    'Comptes de démonstration, données fictives. Le personnel doit valider la double authentification.',
-    'Demo accounts, fictional data. Staff must complete two-factor authentication.',
-  ],
   'auth.or': ['ou', 'or'],
   'auth.social': ['Continuer avec', 'Continue with'],
   'auth.oauthNote': [
